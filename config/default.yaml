@@ -1,0 +1,24 @@
+/event_camera/event_camera_driver:
+  ros__parameters:
+    serial: ""
+    encoding: "evt3"
+    frame_id: "event_camera"
+    packet_duration_us: 1000
+    packet_size_bytes: 1000000
+    publisher_depth: 8
+    statistics_interval_s: 1.0
+
+/event_camera/event_preprocessor:
+  ros__parameters:
+    expected_encoding: "evt3"
+    output_frame_id: ""
+    drop_empty_packets: true
+    drop_unexpected_encoding: true
+    subscription_depth: 8
+    publisher_depth: 8
+    event_image_enabled: true
+    event_image_fps: 25.0
+    event_image_encoding: "bgr8"
+    event_image_publish_empty: true
+    event_image_publisher_depth: 2
+    statistics_interval_s: 1.0
