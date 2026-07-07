@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <diagnostic_msgs/msg/key_value.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <functional>
 #include <stdexcept>
 #include <utility>
@@ -44,6 +46,27 @@ void update_max(
   }
 }
 
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, std::string value)
+{
+  diagnostic_msgs::msg::KeyValue diagnostic_value;
+  diagnostic_value.key = std::move(key);
+  diagnostic_value.value = std::move(value);
+  return diagnostic_value;
+}
+
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const double value)
+{
+  return make_key_value(std::move(key), std::to_string(value));
+}
+
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const std::uint64_t value)
+{
+  return make_key_value(std::move(key), std::to_string(value));
+}
+
 }  // namespace
 
 DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
@@ -60,6 +83,7 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
     declare_parameter<std::int64_t>("publisher_depth", 8);
   statistics_interval_s_ =
     declare_parameter<double>("statistics_interval_s", 1.0);
+  debug_ = declare_parameter<bool>("debug", false);
 
   if (encoding_ != "evt3") {
     throw std::invalid_argument("Only the evt3 encoding is currently supported");
@@ -84,6 +108,11 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
                      .best_effort()
                      .durability_volatile();
   event_publisher_ = create_publisher<EventPacket>("events_raw", qos);
+  const auto diagnostics_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                                 .reliable()
+                                 .durability_volatile();
+  diagnostics_publisher_ =
+    create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
 
   open_camera();
 
@@ -318,20 +347,54 @@ void DriverComponent::print_statistics()
     interarrival_samples == 0 ? 0.0 :
     static_cast<double>(interarrival_ns) / interarrival_samples / ns_per_us;
 
-  RCLCPP_INFO(
-    get_logger(),
-    "driver_stats raw_hz=%.1f raw_mib_s=%.3f avg_raw_kib=%.2f "
-    "publish_hz=%.1f publish_mib_s=%.3f callback_mean_us=%.2f "
-    "callback_max_us=%.2f callback_busy_pct=%.2f "
-    "callback_ns_per_kib=%.2f interarrival_mean_us=%.2f "
-    "interarrival_max_us=%.2f no_subscriber=%llu pending_bytes=%llu",
-    raw_hz, raw_mib_s, average_raw_kib, publish_hz, publish_mib_s,
-    callback_mean_us, callback_max_ns / ns_per_us,
-    callback_busy_pct, callback_ns_per_kib, interarrival_mean_us,
-    interarrival_max_ns / ns_per_us,
-    static_cast<unsigned long long>(no_subscriber),
-    static_cast<unsigned long long>(
-      pending_bytes_.load(std::memory_order_relaxed)));
+  const bool publish_diagnostics =
+    diagnostics_publisher_->get_subscription_count() > 0 ||
+    diagnostics_publisher_->get_intra_process_subscription_count() > 0;
+  if (publish_diagnostics) {
+    DiagnosticArray diagnostics;
+    diagnostics.header.stamp = now();
+
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.name = std::string(get_fully_qualified_name()) + ": driver_stats";
+    status.message = "OK";
+    status.hardware_id = serial_.empty() ? "openeb_camera" : serial_;
+    status.values = {
+      make_key_value("raw_hz", raw_hz),
+      make_key_value("raw_mib_s", raw_mib_s),
+      make_key_value("avg_raw_kib", average_raw_kib),
+      make_key_value("publish_hz", publish_hz),
+      make_key_value("publish_mib_s", publish_mib_s),
+      make_key_value("callback_mean_us", callback_mean_us),
+      make_key_value("callback_max_us", callback_max_ns / ns_per_us),
+      make_key_value("callback_busy_pct", callback_busy_pct),
+      make_key_value("callback_ns_per_kib", callback_ns_per_kib),
+      make_key_value("interarrival_mean_us", interarrival_mean_us),
+      make_key_value("interarrival_max_us", interarrival_max_ns / ns_per_us),
+      make_key_value("no_subscriber", no_subscriber),
+      make_key_value(
+        "pending_bytes", pending_bytes_.load(std::memory_order_relaxed)),
+    };
+    diagnostics.status.push_back(std::move(status));
+    diagnostics_publisher_->publish(std::move(diagnostics));
+  }
+
+  if (debug_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "driver_stats raw_hz=%.1f raw_mib_s=%.3f avg_raw_kib=%.2f "
+      "publish_hz=%.1f publish_mib_s=%.3f callback_mean_us=%.2f "
+      "callback_max_us=%.2f callback_busy_pct=%.2f "
+      "callback_ns_per_kib=%.2f interarrival_mean_us=%.2f "
+      "interarrival_max_us=%.2f no_subscriber=%llu pending_bytes=%llu",
+      raw_hz, raw_mib_s, average_raw_kib, publish_hz, publish_mib_s,
+      callback_mean_us, callback_max_ns / ns_per_us,
+      callback_busy_pct, callback_ns_per_kib, interarrival_mean_us,
+      interarrival_max_ns / ns_per_us,
+      static_cast<unsigned long long>(no_subscriber),
+      static_cast<unsigned long long>(
+        pending_bytes_.load(std::memory_order_relaxed)));
+  }
 }
 
 }  // namespace openeb_ros2

@@ -7,6 +7,7 @@
     packet_size_bytes: 1000000
     publisher_depth: 8
     statistics_interval_s: 1.0
+    debug: false
 
 /event_camera/event_preprocessor:
   ros__parameters:
@@ -22,3 +23,4 @@
     event_image_publish_empty: true
     event_image_publisher_depth: 2
     statistics_interval_s: 1.0
+    debug: false

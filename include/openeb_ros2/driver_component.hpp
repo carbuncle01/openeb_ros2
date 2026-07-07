@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_msgs/msg/event_packet.hpp>
 #include <metavision/sdk/stream/camera.h>
 #include <rclcpp/rclcpp.hpp>
@@ -23,6 +24,7 @@ public:
 
 private:
   using EventPacket = event_camera_msgs::msg::EventPacket;
+  using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
 
   void open_camera();
   void stop_camera() noexcept;
@@ -45,6 +47,7 @@ private:
   bool runtime_error_callback_active_{false};
 
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
+  rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
   EventPacket::UniquePtr pending_packet_;
 
@@ -58,6 +61,7 @@ private:
   std::uint32_t width_{0};
   std::uint32_t height_{0};
   double statistics_interval_s_{1.0};
+  bool debug_{false};
 
   bool has_published_{false};
   std::chrono::steady_clock::time_point last_publish_time_;

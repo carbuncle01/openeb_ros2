@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_codecs/decoder_factory.h>
 #include <event_camera_codecs/event_processor.h>
 #include <event_camera_msgs/msg/event_packet.hpp>
@@ -35,6 +36,7 @@ public:
 
 private:
   using EventPacket = event_camera_msgs::msg::EventPacket;
+  using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
   using EventDecoderFactory =
     event_camera_codecs::DecoderFactory<EventPacket, PreprocessorComponent>;
 
@@ -53,6 +55,7 @@ private:
   rclcpp::Subscription<EventPacket>::SharedPtr event_subscription_;
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr event_image_publisher_;
+  rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::TimerBase::SharedPtr event_image_timer_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
   std::unique_ptr<EventDecoderFactory> event_decoder_factory_;
@@ -67,6 +70,7 @@ private:
   bool event_image_enabled_{true};
   bool event_image_publish_empty_{true};
   bool event_image_subscriber_active_{false};
+  bool debug_{false};
   double event_image_fps_{25.0};
   double statistics_interval_s_{1.0};
   std::uint32_t event_image_width_{0};

@@ -16,6 +16,7 @@ def generate_launch_description():
     statistics_interval_s = ParameterValue(
         LaunchConfiguration("statistics_interval_s"), value_type=float
     )
+    debug = ParameterValue(LaunchConfiguration("debug"), value_type=bool)
     event_image_enabled = ParameterValue(
         LaunchConfiguration("event_image_enabled"), value_type=bool
     )
@@ -46,6 +47,7 @@ def generate_launch_description():
                         "frame_id": frame_id,
                         "packet_duration_us": packet_duration_us,
                         "statistics_interval_s": statistics_interval_s,
+                        "debug": debug,
                     }
                 ],
                 extra_arguments=[{"use_intra_process_comms": True}],
@@ -58,6 +60,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "statistics_interval_s": statistics_interval_s,
+                        "debug": debug,
                         "event_image_enabled": event_image_enabled,
                         "event_image_fps": event_image_fps,
                         "event_image_encoding": LaunchConfiguration(
@@ -80,6 +83,7 @@ def generate_launch_description():
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("packet_duration_us", default_value="1000"),
             DeclareLaunchArgument("statistics_interval_s", default_value="1.0"),
+            DeclareLaunchArgument("debug", default_value="false"),
             DeclareLaunchArgument("event_image_enabled", default_value="true"),
             DeclareLaunchArgument("event_image_fps", default_value="25.0"),
             DeclareLaunchArgument("event_image_encoding", default_value="bgr8"),

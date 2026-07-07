@@ -30,7 +30,7 @@ source install/setup.bash
 ```
 
 The package depends on `openeb_vendor`, `event_camera_msgs`,
-`event_camera_codecs`, and `sensor_msgs`.
+`event_camera_codecs`, `diagnostic_msgs`, and `sensor_msgs`.
 
 ## Run
 
@@ -57,6 +57,8 @@ The default topics under namespace `/event_camera` are:
 - `/event_camera/events_raw`: RAW EVT3 packets from the driver
 - `/event_camera/events`: preprocessor output
 - `/event_camera/event_image`: decoded event image (`bgr8` by default)
+- `/event_camera/diagnostics`: driver and preprocessor statistics as
+  `diagnostic_msgs/msg/DiagnosticArray`
 
 Set a camera serial number when multiple cameras are connected:
 
@@ -86,12 +88,29 @@ reported in `preprocessor_stats`.
 
 ## Internal performance statistics
 
-Both nodes collect low-overhead counters internally and emit structured
-`RCLCPP_INFO` logs. The default interval is one second and can be changed, or
-disabled with zero:
+Both nodes collect low-overhead counters internally and publish structured
+diagnostics. The default interval is one second and can be changed, or disabled
+with zero:
 
 ```bash
 ros2 launch openeb_ros2 composed.launch.py statistics_interval_s:=1.0
+```
+
+The periodic terminal statistics logs are disabled by default. Enable them when
+interactive debugging is useful:
+
+```bash
+ros2 launch openeb_ros2 composed.launch.py debug:=true
+```
+
+For offline debugging, record diagnostics together with the event streams:
+
+```bash
+ros2 bag record \
+  /event_camera/events_raw \
+  /event_camera/events \
+  /event_camera/event_image \
+  /event_camera/diagnostics
 ```
 
 The driver reports:
@@ -116,10 +135,10 @@ The preprocessor reports:
 - event-image frequency, bandwidth, events per image, and timer cost
 - empty, unexpected-encoding, and no-subscriber discard counts
 
-Example log prefixes are `driver_stats` and `preprocessor_stats`. These
-internal counters should be used for the main performance comparison because
-`ros2 topic hz` and `ros2 topic bw` add another subscriber and alter the load
-being measured.
+Diagnostic status names end with `driver_stats` and `preprocessor_stats`.
+These internal counters should be used for the main performance comparison
+because `ros2 topic hz` and `ros2 topic bw` add another subscriber and alter the
+load being measured.
 
 ## Preprocessor extension point
 

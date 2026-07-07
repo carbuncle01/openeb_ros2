@@ -14,6 +14,7 @@
 
   <depend>event_camera_codecs</depend>
   <depend>event_camera_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>

@@ -12,6 +12,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(event_camera_codecs REQUIRED)
 find_package(event_camera_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
@@ -31,6 +32,7 @@ target_include_directories(openeb_driver_component
     $<INSTALL_INTERFACE:include>
 )
 ament_target_dependencies(openeb_driver_component
+  diagnostic_msgs
   event_camera_msgs
   rclcpp
   rclcpp_components
@@ -53,6 +55,7 @@ target_include_directories(openeb_preprocessor_component
     $<INSTALL_INTERFACE:include>
 )
 ament_target_dependencies(openeb_preprocessor_component
+  diagnostic_msgs
   event_camera_codecs
   event_camera_msgs
   rclcpp
@@ -104,6 +107,7 @@ install(
 
 ament_export_include_directories(include)
 ament_export_dependencies(
+  diagnostic_msgs
   event_camera_codecs
   event_camera_msgs
   rclcpp

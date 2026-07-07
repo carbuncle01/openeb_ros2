@@ -7,6 +7,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
     namespace = LaunchConfiguration("namespace")
+    debug = ParameterValue(LaunchConfiguration("debug"), value_type=bool)
 
     return LaunchDescription(
         [
@@ -15,6 +16,7 @@ def generate_launch_description():
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("packet_duration_us", default_value="1000"),
             DeclareLaunchArgument("statistics_interval_s", default_value="1.0"),
+            DeclareLaunchArgument("debug", default_value="false"),
             Node(
                 package="openeb_ros2",
                 executable="openeb_driver_node",
@@ -33,6 +35,7 @@ def generate_launch_description():
                             LaunchConfiguration("statistics_interval_s"),
                             value_type=float,
                         ),
+                        "debug": debug,
                     }
                 ],
             ),

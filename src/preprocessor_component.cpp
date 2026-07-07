@@ -4,6 +4,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <diagnostic_msgs/msg/key_value.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +30,33 @@ void update_max(
   }
 }
 
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, std::string value)
+{
+  diagnostic_msgs::msg::KeyValue diagnostic_value;
+  diagnostic_value.key = std::move(key);
+  diagnostic_value.value = std::move(value);
+  return diagnostic_value;
+}
+
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const double value)
+{
+  return make_key_value(std::move(key), std::to_string(value));
+}
+
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const std::uint64_t value)
+{
+  return make_key_value(std::move(key), std::to_string(value));
+}
+
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const bool value)
+{
+  return make_key_value(std::move(key), std::string(value ? "true" : "false"));
+}
+
 }  // namespace
 
 PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options)
@@ -49,6 +78,7 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     declare_parameter<std::string>("event_image_encoding", "bgr8");
   event_image_publish_empty_ =
     declare_parameter<bool>("event_image_publish_empty", true);
+  debug_ = declare_parameter<bool>("debug", false);
 
   const auto subscription_depth =
     declare_parameter<std::int64_t>("subscription_depth", 8);
@@ -97,6 +127,11 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
 
   event_publisher_ =
     create_publisher<EventPacket>("events", publisher_qos);
+  const auto diagnostics_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                                 .reliable()
+                                 .durability_volatile();
+  diagnostics_publisher_ =
+    create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
   event_subscription_ = create_subscription<EventPacket>(
     "events_raw", subscription_qos,
     std::bind(&PreprocessorComponent::on_packet, this, std::placeholders::_1));
@@ -519,32 +554,86 @@ void PreprocessorComponent::print_statistics()
     image_timer_calls == 0 ? 0.0 :
     static_cast<double>(image_timer_ns) / image_timer_calls / ns_per_us;
 
-  RCLCPP_INFO(
-    get_logger(),
-    "preprocessor_stats receive_hz=%.1f receive_mib_s=%.3f "
-    "avg_packet_kib=%.2f publish_hz=%.1f publish_mib_s=%.3f "
-    "callback_mean_us=%.2f callback_max_us=%.2f callback_busy_pct=%.2f "
-    "callback_ns_per_kib=%.2f "
-    "transport_mean_us=%.2f transport_max_us=%.2f "
-    "decoded_mev_s=%.3f decode_mean_us=%.2f decode_max_us=%.2f "
-    "decode_ns_per_event=%.2f image_hz=%.1f image_mib_s=%.3f "
-    "events_per_image=%.1f image_timer_mean_us=%.2f "
-    "image_timer_max_us=%.2f dropped_empty=%llu dropped_encoding=%llu "
-    "no_subscriber=%llu image_no_subscriber=%llu decode_errors=%llu "
-    "out_of_bounds_events=%llu",
-    receive_hz, receive_mib_s, average_packet_kib, publish_hz,
-    publish_mib_s, callback_mean_us, callback_max_ns / ns_per_us,
-    callback_busy_pct, callback_ns_per_kib, latency_mean_us,
-    latency_max_ns / ns_per_us, decoded_mev_s, decode_mean_us,
-    decode_max_ns / ns_per_us, decode_ns_per_event, image_hz,
-    image_mib_s, events_per_image, image_timer_mean_us,
-    image_timer_max_ns / ns_per_us,
-    static_cast<unsigned long long>(dropped_empty),
-    static_cast<unsigned long long>(dropped_encoding),
-    static_cast<unsigned long long>(no_subscriber),
-    static_cast<unsigned long long>(image_no_subscriber_packets),
-    static_cast<unsigned long long>(decode_errors),
-    static_cast<unsigned long long>(out_of_bounds_events));
+  const bool publish_diagnostics =
+    diagnostics_publisher_->get_subscription_count() > 0 ||
+    diagnostics_publisher_->get_intra_process_subscription_count() > 0;
+  if (publish_diagnostics) {
+    DiagnosticArray diagnostics;
+    diagnostics.header.stamp = now();
+
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    const bool has_warning =
+      dropped_encoding > 0 || decode_errors > 0 || out_of_bounds_events > 0;
+    status.level = has_warning ?
+      diagnostic_msgs::msg::DiagnosticStatus::WARN :
+      diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.name =
+      std::string(get_fully_qualified_name()) + ": preprocessor_stats";
+    status.message = has_warning ? "Packet or decode warnings" : "OK";
+    status.hardware_id = "openeb_preprocessor";
+    status.values = {
+      make_key_value("receive_hz", receive_hz),
+      make_key_value("receive_mib_s", receive_mib_s),
+      make_key_value("avg_packet_kib", average_packet_kib),
+      make_key_value("publish_hz", publish_hz),
+      make_key_value("publish_mib_s", publish_mib_s),
+      make_key_value("callback_mean_us", callback_mean_us),
+      make_key_value("callback_max_us", callback_max_ns / ns_per_us),
+      make_key_value("callback_busy_pct", callback_busy_pct),
+      make_key_value("callback_ns_per_kib", callback_ns_per_kib),
+      make_key_value("transport_mean_us", latency_mean_us),
+      make_key_value("transport_max_us", latency_max_ns / ns_per_us),
+      make_key_value("decoded_mev_s", decoded_mev_s),
+      make_key_value("decode_mean_us", decode_mean_us),
+      make_key_value("decode_max_us", decode_max_ns / ns_per_us),
+      make_key_value("decode_ns_per_event", decode_ns_per_event),
+      make_key_value("image_hz", image_hz),
+      make_key_value("image_mib_s", image_mib_s),
+      make_key_value("events_per_image", events_per_image),
+      make_key_value("image_timer_mean_us", image_timer_mean_us),
+      make_key_value("image_timer_max_us", image_timer_max_ns / ns_per_us),
+      make_key_value("dropped_empty", dropped_empty),
+      make_key_value("dropped_encoding", dropped_encoding),
+      make_key_value("no_subscriber", no_subscriber),
+      make_key_value("image_no_subscriber", image_no_subscriber_packets),
+      make_key_value("decode_errors", decode_errors),
+      make_key_value("out_of_bounds_events", out_of_bounds_events),
+      make_key_value("event_image_enabled", event_image_enabled_),
+      make_key_value(
+        "event_image_subscriber_active", event_image_subscriber_active_),
+    };
+    diagnostics.status.push_back(std::move(status));
+    diagnostics_publisher_->publish(std::move(diagnostics));
+  }
+
+  if (debug_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "preprocessor_stats receive_hz=%.1f receive_mib_s=%.3f "
+      "avg_packet_kib=%.2f publish_hz=%.1f publish_mib_s=%.3f "
+      "callback_mean_us=%.2f callback_max_us=%.2f callback_busy_pct=%.2f "
+      "callback_ns_per_kib=%.2f "
+      "transport_mean_us=%.2f transport_max_us=%.2f "
+      "decoded_mev_s=%.3f decode_mean_us=%.2f decode_max_us=%.2f "
+      "decode_ns_per_event=%.2f image_hz=%.1f image_mib_s=%.3f "
+      "events_per_image=%.1f image_timer_mean_us=%.2f "
+      "image_timer_max_us=%.2f dropped_empty=%llu dropped_encoding=%llu "
+      "no_subscriber=%llu image_no_subscriber=%llu decode_errors=%llu "
+      "out_of_bounds_events=%llu",
+      receive_hz, receive_mib_s, average_packet_kib, publish_hz,
+      publish_mib_s, callback_mean_us, callback_max_ns / ns_per_us,
+      callback_busy_pct, callback_ns_per_kib, latency_mean_us,
+      latency_max_ns / ns_per_us, decoded_mev_s, decode_mean_us,
+      decode_max_ns / ns_per_us, decode_ns_per_event, image_hz,
+      image_mib_s, events_per_image, image_timer_mean_us,
+      image_timer_max_ns / ns_per_us,
+      static_cast<unsigned long long>(dropped_empty),
+      static_cast<unsigned long long>(dropped_encoding),
+      static_cast<unsigned long long>(no_subscriber),
+      static_cast<unsigned long long>(image_no_subscriber_packets),
+      static_cast<unsigned long long>(decode_errors),
+      static_cast<unsigned long long>(out_of_bounds_events));
+  }
 }
 
 }  // namespace openeb_ros2
