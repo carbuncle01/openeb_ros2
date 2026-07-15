@@ -7,7 +7,7 @@ components.
 
 ### `openeb_driver_node`
 
-Opens an OpenEB camera in EVT3 mode and publishes compact RAW packets as
+Opens an OpenEB camera and publishes compact EVT3 RAW packets as
 `event_camera_msgs/msg/EventPacket` on `events_raw`. It does not register a CD
 callback and therefore does not request host-side event decoding during normal
 operation.
@@ -29,8 +29,10 @@ colcon build --packages-select openeb_ros2
 source install/setup.bash
 ```
 
-The package depends on `openeb_vendor`, `event_camera_msgs`,
-`event_camera_codecs`, `diagnostic_msgs`, and `sensor_msgs`.
+The package depends on an installed Metavision SDK/OpenEB, plus
+`event_camera_msgs`, `event_camera_codecs`, `diagnostic_msgs`, and
+`sensor_msgs`. JetPilot installs the CenturyArks SilkyEvCam-enabled OpenEB
+build under `/usr/local`.
 
 ## Run
 

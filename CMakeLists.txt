@@ -19,8 +19,8 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
-# openeb_vendor provides these imported targets on ROS 2 Jazzy. A separately
-# installed OpenEB 5.x can provide the same package configuration.
+# JetPilot uses the CenturyArks SilkyEvCam-enabled OpenEB/Metavision SDK
+# installed under /usr/local.
 find_package(MetavisionSDK COMPONENTS base core stream REQUIRED)
 
 add_library(openeb_driver_component SHARED
