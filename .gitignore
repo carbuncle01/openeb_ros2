@@ -158,6 +158,7 @@ ros2_ws/src/tool/custom_joy_node
 ros2_ws/src/vehicle/pca9685_rc_interface
 ros2_ws/src/vehicle/vesc_interface/vesc
 ros2_ws/src/vehicle/vesc_interface/jetpilot_vesc_interface
+ros2_ws/src/sensing/openeb_ros2
 
 # ROS 2 Workspace Directories
 ros2_ws/build/
