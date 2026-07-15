@@ -73,6 +73,7 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
 : Node("openeb_driver", options)
 {
   serial_ = declare_parameter<std::string>("serial", "");
+  device_format_ = declare_parameter<std::string>("device_format", "");
   encoding_ = to_lower(declare_parameter<std::string>("encoding", "evt3"));
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
   packet_duration_us_ = declare_parameter<std::int64_t>("packet_duration_us", 1000);
@@ -134,7 +135,9 @@ DriverComponent::~DriverComponent()
 void DriverComponent::open_camera()
 {
   Metavision::DeviceConfig config;
-  config.set_format(to_upper(encoding_));
+  if (!device_format_.empty()) {
+    config.set_format(to_upper(device_format_));
+  }
 
   camera_ = serial_.empty() ?
     Metavision::Camera::from_first_available(config) :
@@ -163,8 +166,10 @@ void DriverComponent::open_camera()
   camera_running_ = true;
 
   RCLCPP_INFO(
-    get_logger(), "Started OpenEB camera (%ux%u, encoding=%s, frame_id=%s)",
-    width_, height_, encoding_.c_str(), frame_id_.c_str());
+    get_logger(), "Started OpenEB camera (%ux%u, encoding=%s, device_format=%s, frame_id=%s)",
+    width_, height_, encoding_.c_str(),
+    device_format_.empty() ? "auto" : device_format_.c_str(),
+    frame_id_.c_str());
 }
 
 void DriverComponent::stop_camera() noexcept

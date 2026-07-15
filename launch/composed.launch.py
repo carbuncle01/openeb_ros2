@@ -9,6 +9,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     namespace = LaunchConfiguration("namespace")
     serial = LaunchConfiguration("serial")
+    device_format = LaunchConfiguration("device_format")
     frame_id = LaunchConfiguration("frame_id")
     packet_duration_us = ParameterValue(
         LaunchConfiguration("packet_duration_us"), value_type=int
@@ -44,6 +45,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial": serial,
+                        "device_format": device_format,
                         "frame_id": frame_id,
                         "packet_duration_us": packet_duration_us,
                         "statistics_interval_s": statistics_interval_s,
@@ -80,6 +82,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("namespace", default_value="event_camera"),
             DeclareLaunchArgument("serial", default_value=""),
+            DeclareLaunchArgument("device_format", default_value=""),
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("packet_duration_us", default_value="1000"),
             DeclareLaunchArgument("statistics_interval_s", default_value="1.0"),

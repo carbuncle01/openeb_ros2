@@ -1,6 +1,7 @@
 /event_camera/event_camera_driver:
   ros__parameters:
     serial: ""
+    device_format: ""
     encoding: "evt3"
     frame_id: "event_camera"
     packet_duration_us: 1000

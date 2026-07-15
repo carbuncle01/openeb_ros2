@@ -52,6 +52,7 @@ private:
   EventPacket::UniquePtr pending_packet_;
 
   std::string serial_;
+  std::string device_format_;
   std::string encoding_;
   std::string frame_id_;
   std::int64_t packet_duration_us_{1000};

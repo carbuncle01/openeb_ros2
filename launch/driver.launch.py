@@ -13,6 +13,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("namespace", default_value="event_camera"),
             DeclareLaunchArgument("serial", default_value=""),
+            DeclareLaunchArgument("device_format", default_value=""),
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("packet_duration_us", default_value="1000"),
             DeclareLaunchArgument("statistics_interval_s", default_value="1.0"),
@@ -26,6 +27,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial": LaunchConfiguration("serial"),
+                        "device_format": LaunchConfiguration("device_format"),
                         "frame_id": LaunchConfiguration("frame_id"),
                         "packet_duration_us": ParameterValue(
                             LaunchConfiguration("packet_duration_us"),
