@@ -62,6 +62,10 @@ ament_target_dependencies(openeb_preprocessor_component
   rclcpp_components
   sensor_msgs
 )
+target_link_libraries(openeb_preprocessor_component
+  MetavisionSDK::base
+  MetavisionSDK::core
+)
 rclcpp_components_register_nodes(openeb_preprocessor_component
   "openeb_ros2::PreprocessorComponent"
 )

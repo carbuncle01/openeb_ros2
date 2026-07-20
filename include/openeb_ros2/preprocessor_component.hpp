@@ -7,11 +7,15 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_codecs/decoder_factory.h>
 #include <event_camera_codecs/event_processor.h>
 #include <event_camera_msgs/msg/event_packet.hpp>
+#include <metavision/sdk/base/events/event_cd.h>
+#include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
+#include <opencv2/core/mat.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
@@ -43,8 +47,8 @@ private:
   void on_packet(EventPacket::UniquePtr packet);
   bool preprocess(EventPacket & packet);
   void decode_for_event_image(const EventPacket & packet);
-  void on_event_image_timer();
-  void start_event_image();
+  void on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame);
+  void start_or_update_frame_generator();
   void reset_event_image_decoder();
   bool has_output_subscribers() const;
   bool has_event_image_subscribers() const;
@@ -56,10 +60,10 @@ private:
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr event_image_publisher_;
   rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
-  rclcpp::TimerBase::SharedPtr event_image_timer_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
   std::unique_ptr<EventDecoderFactory> event_decoder_factory_;
-  sensor_msgs::msg::Image::UniquePtr active_event_image_;
+  std::unique_ptr<Metavision::PeriodicFrameGenerationAlgorithm> frame_generation_algo_;
+  std::vector<Metavision::EventCD> cd_buffer_;
 
   std::string expected_encoding_;
   std::string output_frame_id_;

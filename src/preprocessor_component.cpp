@@ -4,10 +4,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <functional>
 #include <limits>
+#include <opencv2/imgproc.hpp>
 #include <stdexcept>
 #include <utility>
 
@@ -144,13 +146,6 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     event_image_channels_ = event_image_encoding_ == "bgr8" ? 3U : 1U;
     event_image_background_value_ =
       event_image_encoding_ == "bgr8" ? 0U : 127U;
-
-    const auto image_period_ns = std::chrono::nanoseconds(
-      std::max<std::int64_t>(
-        1, static_cast<std::int64_t>(1.0e9 / event_image_fps_)));
-    event_image_timer_ = create_wall_timer(
-      image_period_ns,
-      std::bind(&PreprocessorComponent::on_event_image_timer, this));
   }
 
   last_statistics_time_ = std::chrono::steady_clock::now();
@@ -191,6 +186,22 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
   }
 
   if (event_image_enabled_) {
+    const bool has_subscribers = has_event_image_subscribers();
+    if (has_subscribers != event_image_subscriber_active_) {
+      event_image_subscriber_active_ = has_subscribers;
+      reset_event_image_decoder();
+      if (has_subscribers) {
+        RCLCPP_INFO(
+          get_logger(),
+          "Event image output enabled for subscriber (%ux%u, encoding=%s, fps=%.1f)",
+          event_image_width_, event_image_height_,
+          event_image_encoding_.c_str(), event_image_fps_);
+        start_or_update_frame_generator();
+      } else {
+        RCLCPP_INFO(get_logger(), "Event image output paused: no subscribers");
+        frame_generation_algo_.reset();
+      }
+    }
     const bool geometry_changed =
       event_image_width_ != packet->width ||
       event_image_height_ != packet->height;
@@ -201,7 +212,7 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
       event_image_height_ = packet->height;
       reset_event_image_decoder();
       if (event_image_subscriber_active_) {
-        start_event_image();
+        start_or_update_frame_generator();
       }
       if (was_initialized) {
         RCLCPP_WARN(
@@ -257,11 +268,11 @@ bool PreprocessorComponent::preprocess(EventPacket & packet)
 }
 
 void PreprocessorComponent::eventCD(
-  const std::uint64_t, const std::uint16_t x, const std::uint16_t y,
+  const std::uint64_t sensor_time, const std::uint16_t x, const std::uint16_t y,
   const std::uint8_t polarity)
 {
   ++decoded_events_in_packet_;
-  if (!active_event_image_) {
+  if (!frame_generation_algo_) {
     return;
   }
   if (x >= event_image_width_ || y >= event_image_height_) {
@@ -269,16 +280,11 @@ void PreprocessorComponent::eventCD(
     return;
   }
 
-  const auto pixel_index =
-    static_cast<std::size_t>(y) * active_event_image_->step +
-    static_cast<std::size_t>(x) * event_image_channels_;
-  if (event_image_encoding_ == "bgr8") {
-    // ON is blue, OFF is red. A pixel seeing both polarities becomes magenta.
-    active_event_image_->data[pixel_index + (polarity ? 0U : 2U)] = 255U;
-  } else {
-    active_event_image_->data[pixel_index] = polarity ? 255U : 0U;
-  }
-  ++events_in_active_image_;
+  cd_buffer_.emplace_back(
+    static_cast<unsigned short>(x),
+    static_cast<unsigned short>(y),
+    static_cast<short>(polarity),
+    static_cast<Metavision::timestamp>(sensor_time / 1000ULL));
 }
 
 bool PreprocessorComponent::eventExtTrigger(
@@ -307,6 +313,7 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
   const auto decode_start = std::chrono::steady_clock::now();
   decoded_events_in_packet_ = 0;
   out_of_bounds_events_in_packet_ = 0;
+  cd_buffer_.clear();
 
   try {
     auto * decoder = event_decoder_factory_->getInstance(packet);
@@ -326,9 +333,13 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
       "Event image decode failed: %s", error.what());
     reset_event_image_decoder();
     if (event_image_subscriber_active_) {
-      start_event_image();
+      start_or_update_frame_generator();
     }
     return;
+  }
+
+  if (frame_generation_algo_ && !cd_buffer_.empty()) {
+    frame_generation_algo_->process_events(cd_buffer_.cbegin(), cd_buffer_.cend());
   }
 
   const auto decode_ns = static_cast<std::uint64_t>(
@@ -343,87 +354,78 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
   update_max(decode_time_max_ns_, decode_ns);
 }
 
-void PreprocessorComponent::on_event_image_timer()
+void PreprocessorComponent::on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame)
 {
-  const auto timer_start = std::chrono::steady_clock::now();
-  const bool has_subscribers = has_event_image_subscribers();
-
-  if (has_subscribers != event_image_subscriber_active_) {
-    event_image_subscriber_active_ = has_subscribers;
-    reset_event_image_decoder();
-    if (has_subscribers) {
-      RCLCPP_INFO(
-        get_logger(),
-        "Event image output enabled for subscriber (%ux%u, encoding=%s, fps=%.1f)",
-        event_image_width_, event_image_height_,
-        event_image_encoding_.c_str(), event_image_fps_);
-      start_event_image();
-    } else {
-      RCLCPP_INFO(get_logger(), "Event image output paused: no subscribers");
-    }
-  }
-
-  if (!has_subscribers || event_image_width_ == 0 || event_image_height_ == 0) {
-    active_event_image_.reset();
-    events_in_active_image_ = 0;
-  } else if (!active_event_image_) {
-    start_event_image();
-  } else if (event_image_publish_empty_ || events_in_active_image_ > 0) {
-    active_event_image_->header.stamp = now();
-    active_event_image_->header.frame_id = event_image_frame_id_;
-
-    const auto image_bytes = active_event_image_->data.size();
-    image_published_messages_.fetch_add(1, std::memory_order_relaxed);
-    image_published_bytes_.fetch_add(image_bytes, std::memory_order_relaxed);
-    image_published_events_.fetch_add(
-      events_in_active_image_, std::memory_order_relaxed);
-    event_image_publisher_->publish(std::move(active_event_image_));
-    start_event_image();
-  }
-
-  const auto timer_ns = static_cast<std::uint64_t>(
-    std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now() - timer_start).count());
-  image_timer_calls_.fetch_add(1, std::memory_order_relaxed);
-  image_timer_time_ns_.fetch_add(timer_ns, std::memory_order_relaxed);
-  update_max(image_timer_time_max_ns_, timer_ns);
-}
-
-void PreprocessorComponent::start_event_image()
-{
-  if (
-    !event_image_subscriber_active_ || event_image_width_ == 0 ||
-    event_image_height_ == 0)
-  {
+  if (!event_image_publisher_ || !event_image_subscriber_active_) {
     return;
   }
 
-  const auto step =
-    static_cast<std::uint64_t>(event_image_width_) * event_image_channels_;
-  if (
-    step > std::numeric_limits<std::uint32_t>::max() ||
-    static_cast<std::uint64_t>(event_image_height_) >
-    std::numeric_limits<std::size_t>::max() / step)
-  {
-    throw std::overflow_error("Event image dimensions are too large");
-  }
-  const auto image_size =
-    static_cast<std::size_t>(step) * event_image_height_;
+  auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
+  img_msg->header.stamp.sec = static_cast<std::int32_t>(ts_us / 1000000LL);
+  img_msg->header.stamp.nanosec = static_cast<std::uint32_t>((ts_us % 1000000LL) * 1000ULL);
+  img_msg->header.frame_id = event_image_frame_id_;
+  img_msg->height = event_image_height_;
+  img_msg->width = event_image_width_;
+  img_msg->encoding = event_image_encoding_;
+  img_msg->is_bigendian = false;
 
-  active_event_image_ = std::make_unique<sensor_msgs::msg::Image>();
-  active_event_image_->height = event_image_height_;
-  active_event_image_->width = event_image_width_;
-  active_event_image_->encoding = event_image_encoding_;
-  active_event_image_->is_bigendian = false;
-  active_event_image_->step = static_cast<std::uint32_t>(step);
-  active_event_image_->data.assign(
-    image_size, event_image_background_value_);
-  events_in_active_image_ = 0;
+  const std::size_t channels = (event_image_encoding_ == "bgr8") ? 3U : 1U;
+  img_msg->step = event_image_width_ * channels;
+  img_msg->data.resize(img_msg->step * event_image_height_);
+
+  if (frame.rows == static_cast<int>(event_image_height_) &&
+      frame.cols == static_cast<int>(event_image_width_))
+  {
+    if (channels == 3U && frame.channels() == 3) {
+      std::memcpy(img_msg->data.data(), frame.data, img_msg->data.size());
+    } else if (channels == 1U && frame.channels() == 1) {
+      std::memcpy(img_msg->data.data(), frame.data, img_msg->data.size());
+    } else if (channels == 3U && frame.channels() == 1) {
+      cv::cvtColor(frame, frame, cv::COLOR_GRAY2BGR);
+      std::memcpy(img_msg->data.data(), frame.data, img_msg->data.size());
+    } else {
+      const std::size_t copy_bytes = std::min(img_msg->data.size(), static_cast<std::size_t>(frame.total() * frame.elemSize()));
+      std::memcpy(img_msg->data.data(), frame.data, copy_bytes);
+    }
+  }
+
+  const auto image_bytes = img_msg->data.size();
+  image_published_messages_.fetch_add(1, std::memory_order_relaxed);
+  image_published_bytes_.fetch_add(image_bytes, std::memory_order_relaxed);
+  image_published_events_.fetch_add(decoded_events_in_packet_, std::memory_order_relaxed);
+  event_image_publisher_->publish(std::move(img_msg));
+}
+
+void PreprocessorComponent::start_or_update_frame_generator()
+{
+  if (!event_image_subscriber_active_ || event_image_width_ == 0 || event_image_height_ == 0) {
+    frame_generation_algo_.reset();
+    cd_buffer_.clear();
+    return;
+  }
+
+  const std::uint32_t acc_us = (event_image_fps_ > 0.0) ?
+    static_cast<std::uint32_t>(1000000.0 / event_image_fps_) : 40000U;
+
+  frame_generation_algo_ = std::make_unique<Metavision::PeriodicFrameGenerationAlgorithm>(
+    event_image_width_, event_image_height_, acc_us, event_image_fps_);
+
+  if (event_image_encoding_ == "mono8") {
+    frame_generation_algo_->set_parameters(Metavision::ColorPalette::Dark, Metavision::BaseFrameGenerationAlgorithm::GRAY);
+  } else {
+    frame_generation_algo_->set_parameters(Metavision::ColorPalette::Dark, Metavision::BaseFrameGenerationAlgorithm::BGR);
+  }
+
+  frame_generation_algo_->set_output_callback(
+    [this](Metavision::timestamp ts_us, cv::Mat & frame) {
+      on_frame_generated(ts_us, frame);
+    });
 }
 
 void PreprocessorComponent::reset_event_image_decoder()
 {
-  active_event_image_.reset();
+  frame_generation_algo_.reset();
+  cd_buffer_.clear();
   event_decoder_factory_ = std::make_unique<EventDecoderFactory>();
   decoded_events_in_packet_ = 0;
   out_of_bounds_events_in_packet_ = 0;
