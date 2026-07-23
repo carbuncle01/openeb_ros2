@@ -7,6 +7,7 @@
 #include <ctime>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <fstream>
 #include <filesystem>
 #include <functional>
 #include <iomanip>
@@ -38,6 +39,23 @@ std::string to_upper(std::string value)
     value.begin(), value.end(), value.begin(),
     [](const unsigned char c) { return static_cast<char>(std::toupper(c)); });
   return value;
+}
+
+std::string sanitize_label(const std::string & label)
+{
+  std::string safe;
+  safe.reserve(label.size());
+  for (const unsigned char c : label) {
+    if (std::isalnum(c) || c == '-' || c == '_') {
+      safe.push_back(static_cast<char>(c));
+    } else if (!safe.empty() && safe.back() != '_') {
+      safe.push_back('_');
+    }
+  }
+  while (!safe.empty() && safe.back() == '_') {
+    safe.pop_back();
+  }
+  return safe;
 }
 
 void update_max(
@@ -94,6 +112,40 @@ std::string make_timestamp_string()
   return stream.str();
 }
 
+std::string format_system_time_utc(
+  const std::chrono::system_clock::time_point & time_point)
+{
+  const auto time = std::chrono::system_clock::to_time_t(time_point);
+  std::tm utc_time{};
+#if defined(_WIN32)
+  gmtime_s(&utc_time, &time);
+#else
+  gmtime_r(&time, &utc_time);
+#endif
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    time_point.time_since_epoch()).count();
+  const auto fractional_ns = static_cast<long long>((ns % 1000000000LL + 1000000000LL) %
+    1000000000LL);
+  std::ostringstream stream;
+  stream << std::put_time(&utc_time, "%Y-%m-%dT%H:%M:%S")
+         << "." << std::setw(9) << std::setfill('0') << fractional_ns << "Z";
+  return stream.str();
+}
+
+std::string yaml_quote(const std::string & value)
+{
+  std::ostringstream stream;
+  stream << '"';
+  for (const char c : value) {
+    if (c == '\\' || c == '"') {
+      stream << '\\';
+    }
+    stream << c;
+  }
+  stream << '"';
+  return stream.str();
+}
+
 }  // namespace
 
 DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
@@ -105,6 +157,8 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
   raw_recording_enabled_ =
     declare_parameter<bool>("raw_recording_enabled", false);
+  raw_recording_request_topic_ =
+    declare_parameter<std::string>("raw_recording_request_topic", "raw_recording/request");
   raw_recording_auto_start_ =
     declare_parameter<bool>("raw_recording_auto_start", true);
   raw_recording_dir_ =
@@ -159,6 +213,13 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
                                  .durability_volatile();
   diagnostics_publisher_ =
     create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
+  if (!raw_recording_request_topic_.empty()) {
+    raw_recording_request_sub_ = create_subscription<BagRequest>(
+      raw_recording_request_topic_, 10,
+      std::bind(
+        &DriverComponent::handle_raw_recording_request, this,
+        std::placeholders::_1));
+  }
   start_raw_recording_service_ = create_service<Trigger>(
     "start_raw_recording",
     std::bind(
@@ -294,15 +355,20 @@ void DriverComponent::start_raw_recording()
   }
 
   current_raw_recording_path_ = make_raw_recording_path();
+  const auto system_start_time = std::chrono::system_clock::now();
+  const auto ros_start_time = now();
   if (!camera_.start_recording(current_raw_recording_path_)) {
     throw std::runtime_error(
       "OpenEB raw recording did not start: " +
       current_raw_recording_path_.string());
   }
+  write_raw_recording_metadata(
+    current_raw_recording_path_, system_start_time, ros_start_time);
   raw_recording_active_ = true;
   RCLCPP_INFO(
-    get_logger(), "Started OpenEB raw recording: %s",
-    current_raw_recording_path_.string().c_str());
+    get_logger(), "Started OpenEB raw recording: %s (metadata: %s)",
+    current_raw_recording_path_.string().c_str(),
+    current_raw_recording_metadata_path_.string().c_str());
 }
 
 void DriverComponent::stop_raw_recording() noexcept
@@ -328,6 +394,7 @@ void DriverComponent::stop_raw_recording() noexcept
   }
   raw_recording_active_ = false;
   current_raw_recording_path_.clear();
+  current_raw_recording_metadata_path_.clear();
 }
 
 void DriverComponent::rotate_raw_recording()
@@ -340,6 +407,8 @@ void DriverComponent::rotate_raw_recording()
 
     const auto previous_path = current_raw_recording_path_;
     const auto next_path = make_raw_recording_path();
+    const auto system_start_time = std::chrono::system_clock::now();
+    const auto ros_start_time = now();
 
     if (!camera_.start_recording(next_path)) {
       throw std::runtime_error(
@@ -347,6 +416,8 @@ void DriverComponent::rotate_raw_recording()
     }
 
     current_raw_recording_path_ = next_path;
+    write_raw_recording_metadata(
+      current_raw_recording_path_, system_start_time, ros_start_time);
     if (!previous_path.empty()) {
       try {
         camera_.stop_recording(previous_path);
@@ -383,6 +454,54 @@ std::filesystem::path DriverComponent::make_raw_recording_path()
 
   ++raw_recording_index_;
   return std::filesystem::path(raw_recording_dir_) / filename.str();
+}
+
+void DriverComponent::write_raw_recording_metadata(
+  const std::filesystem::path & raw_path,
+  const std::chrono::system_clock::time_point & system_start_time,
+  const rclcpp::Time & ros_start_time)
+{
+  auto metadata_path = raw_path;
+  metadata_path += ".metadata.yaml";
+
+  try {
+    std::ofstream metadata(metadata_path);
+    if (!metadata) {
+      throw std::runtime_error("failed to open metadata file");
+    }
+
+    const auto system_start_unix_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        system_start_time.time_since_epoch()).count();
+
+    metadata
+      << "raw_file: " << yaml_quote(raw_path.string()) << "\n"
+      << "recording_start_system_time_utc: "
+      << yaml_quote(format_system_time_utc(system_start_time)) << "\n"
+      << "recording_start_system_time_unix_ns: " << system_start_unix_ns << "\n"
+      << "recording_start_ros_time_sec: " << ros_start_time.seconds() << "\n"
+      << "recording_start_ros_time_nanoseconds: " << ros_start_time.nanoseconds() << "\n"
+      << "timestamp_reference: "
+      << yaml_quote("Metavision RAW event timestamps are relative to this recording start.")
+      << "\n"
+      << "frame_id: " << yaml_quote(frame_id_) << "\n"
+      << "serial: " << yaml_quote(serial_) << "\n"
+      << "device_format: "
+      << yaml_quote(device_format_.empty() ? std::string("auto") : device_format_) << "\n"
+      << "encoding: " << yaml_quote(encoding_) << "\n"
+      << "width: " << width_ << "\n"
+      << "height: " << height_ << "\n";
+    metadata.close();
+    if (!metadata) {
+      throw std::runtime_error("failed to flush metadata file");
+    }
+    current_raw_recording_metadata_path_ = metadata_path;
+  } catch (const std::exception & error) {
+    current_raw_recording_metadata_path_.clear();
+    RCLCPP_ERROR(
+      get_logger(), "Failed to write OpenEB raw recording metadata '%s': %s",
+      metadata_path.string().c_str(), error.what());
+  }
 }
 
 void DriverComponent::handle_start_raw_recording(
@@ -425,6 +544,45 @@ void DriverComponent::handle_stop_raw_recording(
   response->message = was_active ?
     "OpenEB raw recording stopped: " + path :
     "OpenEB raw recording was not active";
+}
+
+void DriverComponent::handle_raw_recording_request(const BagRequest::SharedPtr request)
+{
+  if (!request) {
+    return;
+  }
+
+  try {
+    if (request->command == BagRequest::START) {
+      const auto safe_label = sanitize_label(request->label);
+      {
+        std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+        if (!raw_recording_active_ && !safe_label.empty()) {
+          raw_recording_basename_ = safe_label;
+        }
+      }
+      start_raw_recording();
+      RCLCPP_INFO(get_logger(), "OpenEB raw recording START request accepted");
+    } else if (request->command == BagRequest::STOP) {
+      stop_raw_recording();
+      RCLCPP_INFO(get_logger(), "OpenEB raw recording STOP request accepted");
+    } else if (request->command == BagRequest::SPLIT) {
+      rotate_raw_recording();
+      RCLCPP_INFO(get_logger(), "OpenEB raw recording SPLIT request accepted");
+    } else if (request->command == BagRequest::MARK) {
+      RCLCPP_INFO(
+        get_logger(), "OpenEB raw recording MARK request: %s",
+        request->label.c_str());
+    } else {
+      RCLCPP_WARN(
+        get_logger(), "Unknown OpenEB raw recording request command: %u",
+        request->command);
+    }
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(
+      get_logger(), "Failed to handle OpenEB raw recording request: %s",
+      error.what());
+  }
 }
 
 void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t size)
@@ -582,10 +740,12 @@ void DriverComponent::print_statistics()
 
   bool raw_recording_active = false;
   std::string raw_recording_path;
+  std::string raw_recording_metadata_path;
   {
     std::lock_guard<std::mutex> lock(raw_recording_mutex_);
     raw_recording_active = raw_recording_active_;
     raw_recording_path = current_raw_recording_path_.string();
+    raw_recording_metadata_path = current_raw_recording_metadata_path_.string();
   }
 
   const bool publish_diagnostics =
@@ -614,12 +774,14 @@ void DriverComponent::print_statistics()
       make_key_value("interarrival_max_us", interarrival_max_ns / ns_per_us),
       make_key_value("no_subscriber", no_subscriber),
       make_key_value("raw_recording_enabled", raw_recording_enabled_),
+      make_key_value("raw_recording_request_topic", raw_recording_request_topic_),
       make_key_value("raw_recording_auto_start", raw_recording_auto_start_),
       make_key_value("raw_recording_active", raw_recording_active),
       make_key_value(
         "raw_recording_split_duration_s",
         raw_recording_split_duration_s_),
       make_key_value("raw_recording_path", raw_recording_path),
+      make_key_value("raw_recording_metadata_path", raw_recording_metadata_path),
       make_key_value(
         "pending_bytes", pending_bytes_.load(std::memory_order_relaxed)),
     };

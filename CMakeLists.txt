@@ -15,6 +15,7 @@ find_package(ament_cmake REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(event_camera_codecs REQUIRED)
 find_package(event_camera_msgs REQUIRED)
+find_package(jetpilot_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -35,6 +36,7 @@ target_include_directories(openeb_driver_component
 ament_target_dependencies(openeb_driver_component
   diagnostic_msgs
   event_camera_msgs
+  jetpilot_msgs
   rclcpp
   rclcpp_components
   std_srvs
@@ -116,6 +118,7 @@ ament_export_dependencies(
   diagnostic_msgs
   event_camera_codecs
   event_camera_msgs
+  jetpilot_msgs
   rclcpp
   rclcpp_components
   sensor_msgs

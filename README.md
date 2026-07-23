@@ -51,8 +51,13 @@ ros2 launch openeb_ros2 driver.launch.py \
   raw_recording_dir:=/path/to/recordings
 ```
 
-To arm RAW recording but start it from the same orchestration that starts
-`ros2 bag record`, disable auto-start and call the driver services:
+Metavision RAW event timestamps are relative to the RAW recording start, not
+absolute wall-clock time. For each `*.raw` file, the driver writes a
+`*.raw.metadata.yaml` sidecar containing the UTC start time, Unix nanoseconds,
+ROS time, frame id, serial, format, encoding, and image size.
+
+To arm RAW recording but start it from JetPilot orchestration, disable
+auto-start and publish `jetpilot_msgs/msg/BagRequest` to the request topic:
 
 ```bash
 ros2 launch openeb_ros2 driver.launch.py \
@@ -62,16 +67,22 @@ ros2 launch openeb_ros2 driver.launch.py \
 ```
 
 ```bash
-ros2 service call \
-  /event_camera/event_camera_driver/start_raw_recording \
-  std_srvs/srv/Trigger '{}'
+ros2 topic pub --once \
+  /event_camera/raw_recording/request \
+  jetpilot_msgs/msg/BagRequest \
+  "{command: 1, label: drive_raw}"
 ```
 
 ```bash
-ros2 service call \
-  /event_camera/event_camera_driver/stop_raw_recording \
-  std_srvs/srv/Trigger '{}'
+ros2 topic pub --once \
+  /event_camera/raw_recording/request \
+  jetpilot_msgs/msg/BagRequest \
+  "{command: 2, label: stop}"
 ```
+
+`BagRequest.START`, `STOP`, and `SPLIT` control RAW recording. `MARK` is logged
+without changing recording state. The driver still exposes
+`start_raw_recording` and `stop_raw_recording` services for low-level checks.
 
 To create time-split RAW files, set a positive split duration:
 

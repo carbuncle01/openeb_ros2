@@ -46,6 +46,9 @@ def generate_launch_description():
             DeclareLaunchArgument("device_format", default_value=""),
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("raw_recording_enabled", default_value="false"),
+            DeclareLaunchArgument(
+                "raw_recording_request_topic", default_value="raw_recording/request"
+            ),
             DeclareLaunchArgument("raw_recording_auto_start", default_value="true"),
             DeclareLaunchArgument("raw_recording_dir", default_value=""),
             DeclareLaunchArgument("raw_recording_basename", default_value="openeb"),
@@ -76,6 +79,9 @@ def generate_launch_description():
                         "device_format": device_format,
                         "frame_id": frame_id,
                         "raw_recording_enabled": raw_recording_enabled,
+                        "raw_recording_request_topic": LaunchConfiguration(
+                            "raw_recording_request_topic"
+                        ),
                         "raw_recording_auto_start": raw_recording_auto_start,
                         "raw_recording_dir": LaunchConfiguration("raw_recording_dir"),
                         "raw_recording_basename": LaunchConfiguration(

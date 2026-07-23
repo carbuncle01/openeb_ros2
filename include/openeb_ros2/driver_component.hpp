@@ -12,6 +12,7 @@
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_msgs/msg/event_packet.hpp>
+#include <jetpilot_msgs/msg/bag_request.hpp>
 #include <metavision/sdk/stream/camera.h>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -28,6 +29,7 @@ public:
 private:
   using EventPacket = event_camera_msgs::msg::EventPacket;
   using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
+  using BagRequest = jetpilot_msgs::msg::BagRequest;
   using Trigger = std_srvs::srv::Trigger;
 
   void open_camera();
@@ -36,12 +38,17 @@ private:
   void stop_raw_recording() noexcept;
   void rotate_raw_recording();
   std::filesystem::path make_raw_recording_path();
+  void write_raw_recording_metadata(
+    const std::filesystem::path & raw_path,
+    const std::chrono::system_clock::time_point & system_start_time,
+    const rclcpp::Time & ros_start_time);
   void handle_start_raw_recording(
     const std::shared_ptr<Trigger::Request> request,
     std::shared_ptr<Trigger::Response> response);
   void handle_stop_raw_recording(
     const std::shared_ptr<Trigger::Request> request,
     std::shared_ptr<Trigger::Response> response);
+  void handle_raw_recording_request(const BagRequest::SharedPtr request);
   void on_raw_data(const std::uint8_t * data, std::size_t size);
   void publish_pending_packet(
     const std::chrono::steady_clock::time_point & publish_time);
@@ -62,6 +69,7 @@ private:
 
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  rclcpp::Subscription<BagRequest>::SharedPtr raw_recording_request_sub_;
   rclcpp::Service<Trigger>::SharedPtr start_raw_recording_service_;
   rclcpp::Service<Trigger>::SharedPtr stop_raw_recording_service_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
@@ -72,6 +80,7 @@ private:
   std::string device_format_;
   std::string encoding_;
   std::string frame_id_;
+  std::string raw_recording_request_topic_;
   std::string raw_recording_dir_;
   std::string raw_recording_basename_;
   std::int64_t packet_duration_us_{1000};
@@ -90,6 +99,7 @@ private:
 
   std::mutex raw_recording_mutex_;
   std::filesystem::path current_raw_recording_path_;
+  std::filesystem::path current_raw_recording_metadata_path_;
 
   bool has_published_{false};
   std::chrono::steady_clock::time_point last_publish_time_;

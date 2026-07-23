@@ -5,6 +5,7 @@
     encoding: "evt3"
     frame_id: "event_camera"
     raw_recording_enabled: false
+    raw_recording_request_topic: "raw_recording/request"
     raw_recording_auto_start: true
     raw_recording_dir: ""
     raw_recording_basename: "openeb"
