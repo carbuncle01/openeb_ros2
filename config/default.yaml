@@ -4,6 +4,11 @@
     device_format: ""
     encoding: "evt3"
     frame_id: "event_camera"
+    raw_recording_enabled: false
+    raw_recording_auto_start: true
+    raw_recording_dir: ""
+    raw_recording_basename: "openeb"
+    raw_recording_split_duration_s: 0.0
     packet_duration_us: 1000
     packet_size_bytes: 1000000
     publisher_depth: 8

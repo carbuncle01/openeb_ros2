@@ -4,10 +4,16 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <ctime>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <filesystem>
 #include <functional>
+#include <iomanip>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 #include <metavision/hal/utils/device_config.h>
@@ -67,6 +73,27 @@ diagnostic_msgs::msg::KeyValue make_key_value(
   return make_key_value(std::move(key), std::to_string(value));
 }
 
+diagnostic_msgs::msg::KeyValue make_key_value(
+  std::string key, const bool value)
+{
+  return make_key_value(std::move(key), std::string(value ? "true" : "false"));
+}
+
+std::string make_timestamp_string()
+{
+  const auto now = std::chrono::system_clock::now();
+  const auto time = std::chrono::system_clock::to_time_t(now);
+  std::tm local_time{};
+#if defined(_WIN32)
+  localtime_s(&local_time, &time);
+#else
+  localtime_r(&time, &local_time);
+#endif
+  std::ostringstream stream;
+  stream << std::put_time(&local_time, "%Y%m%d_%H%M%S");
+  return stream.str();
+}
+
 }  // namespace
 
 DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
@@ -76,6 +103,16 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   device_format_ = declare_parameter<std::string>("device_format", "");
   encoding_ = to_lower(declare_parameter<std::string>("encoding", "evt3"));
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
+  raw_recording_enabled_ =
+    declare_parameter<bool>("raw_recording_enabled", false);
+  raw_recording_auto_start_ =
+    declare_parameter<bool>("raw_recording_auto_start", true);
+  raw_recording_dir_ =
+    declare_parameter<std::string>("raw_recording_dir", "");
+  raw_recording_basename_ =
+    declare_parameter<std::string>("raw_recording_basename", "");
+  raw_recording_split_duration_s_ =
+    declare_parameter<double>("raw_recording_split_duration_s", 0.0);
   packet_duration_us_ = declare_parameter<std::int64_t>("packet_duration_us", 1000);
 
   const auto packet_size =
@@ -101,6 +138,14 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   if (statistics_interval_s_ < 0.0) {
     throw std::invalid_argument("statistics_interval_s must be non-negative");
   }
+  if (raw_recording_enabled_ && raw_recording_dir_.empty()) {
+    throw std::invalid_argument(
+      "raw_recording_dir must be set when raw_recording_enabled is true");
+  }
+  if (raw_recording_split_duration_s_ < 0.0) {
+    throw std::invalid_argument(
+      "raw_recording_split_duration_s must be non-negative");
+  }
 
   packet_size_bytes_ = static_cast<std::size_t>(packet_size);
 
@@ -114,6 +159,16 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
                                  .durability_volatile();
   diagnostics_publisher_ =
     create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
+  start_raw_recording_service_ = create_service<Trigger>(
+    "start_raw_recording",
+    std::bind(
+      &DriverComponent::handle_start_raw_recording, this,
+      std::placeholders::_1, std::placeholders::_2));
+  stop_raw_recording_service_ = create_service<Trigger>(
+    "stop_raw_recording",
+    std::bind(
+      &DriverComponent::handle_stop_raw_recording, this,
+      std::placeholders::_1, std::placeholders::_2));
 
   open_camera();
 
@@ -124,6 +179,15 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
         1, static_cast<std::int64_t>(statistics_interval_s_ * 1000.0)));
     statistics_timer_ = create_wall_timer(
       period_ms, std::bind(&DriverComponent::print_statistics, this));
+  }
+
+  if (raw_recording_enabled_ && raw_recording_split_duration_s_ > 0.0) {
+    const auto period_ms = std::chrono::milliseconds(
+      std::max<std::int64_t>(
+        1,
+        static_cast<std::int64_t>(raw_recording_split_duration_s_ * 1000.0)));
+    raw_recording_split_timer_ = create_wall_timer(
+      period_ms, std::bind(&DriverComponent::rotate_raw_recording, this));
   }
 }
 
@@ -160,7 +224,12 @@ void DriverComponent::open_camera()
     });
   runtime_error_callback_active_ = true;
 
+  if (raw_recording_enabled_ && raw_recording_auto_start_) {
+    start_raw_recording();
+  }
+
   if (!camera_.start()) {
+    stop_raw_recording();
     throw std::runtime_error("OpenEB camera did not start");
   }
   camera_running_ = true;
@@ -179,6 +248,7 @@ void DriverComponent::stop_camera() noexcept
   }
 
   try {
+    stop_raw_recording();
     if (camera_running_) {
       camera_.stop();
       camera_running_ = false;
@@ -197,6 +267,164 @@ void DriverComponent::stop_camera() noexcept
 
   pending_packet_.reset();
   camera_open_ = false;
+}
+
+void DriverComponent::start_raw_recording()
+{
+  std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+  if (!raw_recording_enabled_) {
+    throw std::runtime_error("raw_recording_enabled is false");
+  }
+  if (!camera_open_) {
+    throw std::runtime_error("camera is not open");
+  }
+  if (raw_recording_active_) {
+    return;
+  }
+  if (raw_recording_dir_.empty()) {
+    throw std::runtime_error("raw_recording_dir is empty");
+  }
+
+  std::error_code error_code;
+  std::filesystem::create_directories(raw_recording_dir_, error_code);
+  if (error_code) {
+    throw std::runtime_error(
+      "Failed to create raw recording directory '" + raw_recording_dir_ +
+      "': " + error_code.message());
+  }
+
+  current_raw_recording_path_ = make_raw_recording_path();
+  if (!camera_.start_recording(current_raw_recording_path_)) {
+    throw std::runtime_error(
+      "OpenEB raw recording did not start: " +
+      current_raw_recording_path_.string());
+  }
+  raw_recording_active_ = true;
+  RCLCPP_INFO(
+    get_logger(), "Started OpenEB raw recording: %s",
+    current_raw_recording_path_.string().c_str());
+}
+
+void DriverComponent::stop_raw_recording() noexcept
+{
+  std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+  if (!raw_recording_active_) {
+    return;
+  }
+
+  try {
+    if (!current_raw_recording_path_.empty()) {
+      camera_.stop_recording(current_raw_recording_path_);
+    } else {
+      camera_.stop_recording();
+    }
+    RCLCPP_INFO(
+      get_logger(), "Stopped OpenEB raw recording: %s",
+      current_raw_recording_path_.string().c_str());
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(
+      get_logger(), "Failed to stop OpenEB raw recording cleanly: %s",
+      error.what());
+  }
+  raw_recording_active_ = false;
+  current_raw_recording_path_.clear();
+}
+
+void DriverComponent::rotate_raw_recording()
+{
+  std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+  try {
+    if (!raw_recording_enabled_ || !camera_open_ || !raw_recording_active_) {
+      return;
+    }
+
+    const auto previous_path = current_raw_recording_path_;
+    const auto next_path = make_raw_recording_path();
+
+    if (!camera_.start_recording(next_path)) {
+      throw std::runtime_error(
+        "OpenEB raw recording did not start: " + next_path.string());
+    }
+
+    current_raw_recording_path_ = next_path;
+    if (!previous_path.empty()) {
+      try {
+        camera_.stop_recording(previous_path);
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "Failed to stop previous OpenEB raw recording '%s': %s",
+          previous_path.string().c_str(), error.what());
+      }
+    }
+
+    RCLCPP_INFO(
+      get_logger(), "Rotated OpenEB raw recording: %s",
+      current_raw_recording_path_.string().c_str());
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(
+      get_logger(), "Failed to rotate OpenEB raw recording: %s", error.what());
+  }
+}
+
+std::filesystem::path DriverComponent::make_raw_recording_path()
+{
+  const auto basename = raw_recording_basename_.empty() ?
+    std::string("openeb") :
+    raw_recording_basename_;
+  const auto serial = serial_.empty() ? std::string("camera") : serial_;
+
+  std::ostringstream filename;
+  filename << basename << "_" << serial << "_" << make_timestamp_string();
+  if (raw_recording_split_duration_s_ > 0.0) {
+    filename << "_" << std::setw(6) << std::setfill('0') << raw_recording_index_;
+  }
+  filename << ".raw";
+
+  ++raw_recording_index_;
+  return std::filesystem::path(raw_recording_dir_) / filename.str();
+}
+
+void DriverComponent::handle_start_raw_recording(
+  const std::shared_ptr<Trigger::Request> request,
+  std::shared_ptr<Trigger::Response> response)
+{
+  (void)request;
+  try {
+    start_raw_recording();
+    std::string path;
+    {
+      std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+      path = current_raw_recording_path_.string();
+    }
+    response->success = true;
+    response->message = path.empty() ?
+      "OpenEB raw recording is already active" :
+      "OpenEB raw recording active: " + path;
+  } catch (const std::exception & error) {
+    response->success = false;
+    response->message = error.what();
+  }
+}
+
+void DriverComponent::handle_stop_raw_recording(
+  const std::shared_ptr<Trigger::Request> request,
+  std::shared_ptr<Trigger::Response> response)
+{
+  (void)request;
+  std::string path;
+  bool was_active = false;
+  {
+    std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+    was_active = raw_recording_active_;
+    path = current_raw_recording_path_.string();
+  }
+
+  stop_raw_recording();
+  response->success = true;
+  response->message = was_active ?
+    "OpenEB raw recording stopped: " + path :
+    "OpenEB raw recording was not active";
 }
 
 void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t size)
@@ -352,6 +580,14 @@ void DriverComponent::print_statistics()
     interarrival_samples == 0 ? 0.0 :
     static_cast<double>(interarrival_ns) / interarrival_samples / ns_per_us;
 
+  bool raw_recording_active = false;
+  std::string raw_recording_path;
+  {
+    std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+    raw_recording_active = raw_recording_active_;
+    raw_recording_path = current_raw_recording_path_.string();
+  }
+
   const bool publish_diagnostics =
     diagnostics_publisher_->get_subscription_count() > 0 ||
     diagnostics_publisher_->get_intra_process_subscription_count() > 0;
@@ -377,6 +613,13 @@ void DriverComponent::print_statistics()
       make_key_value("interarrival_mean_us", interarrival_mean_us),
       make_key_value("interarrival_max_us", interarrival_max_ns / ns_per_us),
       make_key_value("no_subscriber", no_subscriber),
+      make_key_value("raw_recording_enabled", raw_recording_enabled_),
+      make_key_value("raw_recording_auto_start", raw_recording_auto_start_),
+      make_key_value("raw_recording_active", raw_recording_active),
+      make_key_value(
+        "raw_recording_split_duration_s",
+        raw_recording_split_duration_s_),
+      make_key_value("raw_recording_path", raw_recording_path),
       make_key_value(
         "pending_bytes", pending_bytes_.load(std::memory_order_relaxed)),
     };
@@ -391,14 +634,17 @@ void DriverComponent::print_statistics()
       "publish_hz=%.1f publish_mib_s=%.3f callback_mean_us=%.2f "
       "callback_max_us=%.2f callback_busy_pct=%.2f "
       "callback_ns_per_kib=%.2f interarrival_mean_us=%.2f "
-      "interarrival_max_us=%.2f no_subscriber=%llu pending_bytes=%llu",
+      "interarrival_max_us=%.2f no_subscriber=%llu pending_bytes=%llu "
+      "raw_recording_active=%s raw_recording_path=%s",
       raw_hz, raw_mib_s, average_raw_kib, publish_hz, publish_mib_s,
       callback_mean_us, callback_max_ns / ns_per_us,
       callback_busy_pct, callback_ns_per_kib, interarrival_mean_us,
       interarrival_max_ns / ns_per_us,
       static_cast<unsigned long long>(no_subscriber),
       static_cast<unsigned long long>(
-        pending_bytes_.load(std::memory_order_relaxed)));
+        pending_bytes_.load(std::memory_order_relaxed)),
+      raw_recording_active ? "true" : "false",
+      raw_recording_path.c_str());
   }
 }
 

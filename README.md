@@ -42,6 +42,50 @@ Run the driver only:
 ros2 launch openeb_ros2 driver.launch.py
 ```
 
+Record the camera stream directly to an OpenEB RAW file while the driver is
+running:
+
+```bash
+ros2 launch openeb_ros2 driver.launch.py \
+  raw_recording_enabled:=true \
+  raw_recording_dir:=/path/to/recordings
+```
+
+To arm RAW recording but start it from the same orchestration that starts
+`ros2 bag record`, disable auto-start and call the driver services:
+
+```bash
+ros2 launch openeb_ros2 driver.launch.py \
+  raw_recording_enabled:=true \
+  raw_recording_auto_start:=false \
+  raw_recording_dir:=/path/to/recordings
+```
+
+```bash
+ros2 service call \
+  /event_camera/event_camera_driver/start_raw_recording \
+  std_srvs/srv/Trigger '{}'
+```
+
+```bash
+ros2 service call \
+  /event_camera/event_camera_driver/stop_raw_recording \
+  std_srvs/srv/Trigger '{}'
+```
+
+To create time-split RAW files, set a positive split duration:
+
+```bash
+ros2 launch openeb_ros2 driver.launch.py \
+  raw_recording_enabled:=true \
+  raw_recording_dir:=/path/to/recordings \
+  raw_recording_split_duration_s:=60.0
+```
+
+Split rotation starts the next RAW file before stopping the previous one, so the
+boundary favors avoiding gaps over avoiding a tiny overlap. Leave
+`raw_recording_split_duration_s` at `0.0` for a single continuous file.
+
 Run driver and preprocessor as separate processes:
 
 ```bash

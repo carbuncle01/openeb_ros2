@@ -18,6 +18,7 @@ find_package(event_camera_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # JetPilot uses the CenturyArks SilkyEvCam-enabled OpenEB/Metavision SDK
 # installed under /usr/local.
@@ -36,6 +37,7 @@ ament_target_dependencies(openeb_driver_component
   event_camera_msgs
   rclcpp
   rclcpp_components
+  std_srvs
 )
 target_link_libraries(openeb_driver_component
   MetavisionSDK::base
@@ -117,5 +119,6 @@ ament_export_dependencies(
   rclcpp
   rclcpp_components
   sensor_msgs
+  std_srvs
 )
 ament_package()
