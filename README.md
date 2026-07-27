@@ -84,6 +84,13 @@ ros2 topic pub --once \
 without changing recording state. The driver still exposes
 `start_raw_recording` and `stop_raw_recording` services for low-level checks.
 
+When a START request carries an absolute path in `label`, the driver uses that
+path as the RAW output directory instead of using the label as a filename
+prefix. JetPilot's bag manager uses this form after the rosbag session
+directory has been created, so MCAP, OpenEB RAW, and the RAW metadata sidecar
+are stored together. STOP from the same `/bag/request` trigger is relayed to
+the driver before rosbag shutdown.
+
 To create time-split RAW files, set a positive split duration:
 
 ```bash

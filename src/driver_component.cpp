@@ -554,11 +554,19 @@ void DriverComponent::handle_raw_recording_request(const BagRequest::SharedPtr r
 
   try {
     if (request->command == BagRequest::START) {
-      const auto safe_label = sanitize_label(request->label);
+      const auto requested_path = std::filesystem::path(request->label);
+      const auto use_requested_directory =
+        !request->label.empty() && requested_path.is_absolute();
+      const auto safe_label = use_requested_directory ?
+        std::string() : sanitize_label(request->label);
       {
         std::lock_guard<std::mutex> lock(raw_recording_mutex_);
-        if (!raw_recording_active_ && !safe_label.empty()) {
-          raw_recording_basename_ = safe_label;
+        if (!raw_recording_active_) {
+          if (use_requested_directory) {
+            raw_recording_dir_ = requested_path.lexically_normal().string();
+          } else if (!safe_label.empty()) {
+            raw_recording_basename_ = safe_label;
+          }
         }
       }
       start_raw_recording();
