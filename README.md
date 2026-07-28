@@ -89,7 +89,9 @@ path as the RAW output directory instead of using the label as a filename
 prefix. JetPilot's bag manager uses this form after the rosbag session
 directory has been created, so MCAP, OpenEB RAW, and the RAW metadata sidecar
 are stored together. STOP from the same `/bag/request` trigger is relayed to
-the driver before rosbag shutdown.
+the driver before rosbag shutdown. In the integrated JetPilot launch, RAW's
+own duration timer remains disabled; the bag manager sends scheduled SPLIT
+requests from the single `recording_split_duration_s` setting.
 
 To create time-split RAW files, set a positive split duration:
 
