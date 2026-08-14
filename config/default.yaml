@@ -4,6 +4,10 @@
     device_format: ""
     encoding: "evt3"
     frame_id: "event_camera"
+    timing_enabled: false
+    timing_topic: "packet_timing"
+    timing_publisher_depth: 8
+    stream_epoch: 0
     raw_recording_enabled: false
     raw_recording_auto_start: true
     raw_recording_dir: ""

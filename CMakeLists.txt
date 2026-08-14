@@ -17,12 +17,21 @@ find_package(event_camera_codecs REQUIRED)
 find_package(event_camera_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
 # JetPilot uses the CenturyArks SilkyEvCam-enabled OpenEB/Metavision SDK
 # installed under /usr/local.
 find_package(MetavisionSDK COMPONENTS base core stream REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/PacketTiming.msg"
+  DEPENDENCIES std_msgs
+)
+rosidl_get_typesupport_target(openeb_ros2_typesupport_cpp
+  ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 add_library(openeb_driver_component SHARED
   src/driver_component.cpp
@@ -37,9 +46,11 @@ ament_target_dependencies(openeb_driver_component
   event_camera_msgs
   rclcpp
   rclcpp_components
+  std_msgs
   std_srvs
 )
 target_link_libraries(openeb_driver_component
+  "${openeb_ros2_typesupport_cpp}"
   MetavisionSDK::base
   MetavisionSDK::core
   MetavisionSDK::stream
@@ -118,7 +129,9 @@ ament_export_dependencies(
   event_camera_msgs
   rclcpp
   rclcpp_components
+  rosidl_default_runtime
   sensor_msgs
+  std_msgs
   std_srvs
 )
 ament_package()

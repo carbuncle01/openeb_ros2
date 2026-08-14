@@ -12,6 +12,18 @@ Opens an OpenEB camera and publishes compact EVT3 RAW packets as
 callback and therefore does not request host-side event decoding during normal
 operation.
 
+The driver can optionally publish `openeb_ros2/msg/PacketTiming` on
+`packet_timing`. This companion message has the same packet header and sequence
+as `events_raw` and records the first/last SDK RAW callback arrival plus the
+instant immediately before publishing the EventPacket, in both host steady and
+system clock nanoseconds. Multiple SDK callbacks may be aggregated into one
+EventPacket, so the first and last arrival timestamps are intentionally
+separate.
+
+Timing publication is disabled by default. Enabling it does not rename or
+change the type or contents of `events_raw`, `events`, or `event_image`, and it
+does not add online EVT3 decoding.
+
 ### `openeb_preprocessor_node`
 
 Subscribes to `events_raw` and publishes validated RAW packets on `events`. It
@@ -41,6 +53,21 @@ Run the driver only:
 ```bash
 ros2 launch openeb_ros2 driver.launch.py
 ```
+
+Enable packet timing metadata for an acquisition epoch:
+
+```bash
+ros2 launch openeb_ros2 driver.launch.py \
+  timing_enabled:=true \
+  stream_epoch:=0
+```
+
+Increment `stream_epoch` whenever the camera stream is restarted or
+reconnected within the same acquisition. The values in `PacketTiming` are
+driver-observation timestamps. They are not decoded event sensor timestamps,
+DDS send timestamps, or recorder receive timestamps. Decode the first and last
+EVT3 event timestamps offline and join them by packet sequence when those
+source timestamps are required.
 
 Record the camera stream directly to an OpenEB RAW file while the driver is
 running:
@@ -103,6 +130,8 @@ The default topics under namespace `/event_camera` are:
 - `/event_camera/events_raw`: RAW EVT3 packets from the driver
 - `/event_camera/events`: preprocessor output
 - `/event_camera/event_image`: decoded event image (`bgr8` by default)
+- `/event_camera/packet_timing`: optional driver timing companion for
+  `events_raw` (`timing_enabled:=true`)
 - `/event_camera/diagnostics`: driver and preprocessor statistics as
   `diagnostic_msgs/msg/DiagnosticArray`
 
@@ -154,6 +183,7 @@ For offline debugging, record diagnostics together with the event streams:
 ```bash
 ros2 bag record \
   /event_camera/events_raw \
+  /event_camera/packet_timing \
   /event_camera/events \
   /event_camera/event_image \
   /event_camera/diagnostics

@@ -18,6 +18,15 @@ def generate_launch_description():
         LaunchConfiguration("statistics_interval_s"), value_type=float
     )
     debug = ParameterValue(LaunchConfiguration("debug"), value_type=bool)
+    timing_enabled = ParameterValue(
+        LaunchConfiguration("timing_enabled"), value_type=bool
+    )
+    timing_publisher_depth = ParameterValue(
+        LaunchConfiguration("timing_publisher_depth"), value_type=int
+    )
+    stream_epoch = ParameterValue(
+        LaunchConfiguration("stream_epoch"), value_type=int
+    )
     raw_recording_enabled = ParameterValue(
         LaunchConfiguration("raw_recording_enabled"), value_type=bool
     )
@@ -56,6 +65,10 @@ def generate_launch_description():
                         "serial": serial,
                         "device_format": device_format,
                         "frame_id": frame_id,
+                        "timing_enabled": timing_enabled,
+                        "timing_topic": LaunchConfiguration("timing_topic"),
+                        "timing_publisher_depth": timing_publisher_depth,
+                        "stream_epoch": stream_epoch,
                         "raw_recording_enabled": raw_recording_enabled,
                         "raw_recording_auto_start": raw_recording_auto_start,
                         "raw_recording_dir": LaunchConfiguration("raw_recording_dir"),
@@ -100,6 +113,10 @@ def generate_launch_description():
             DeclareLaunchArgument("serial", default_value=""),
             DeclareLaunchArgument("device_format", default_value=""),
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
+            DeclareLaunchArgument("timing_enabled", default_value="false"),
+            DeclareLaunchArgument("timing_topic", default_value="packet_timing"),
+            DeclareLaunchArgument("timing_publisher_depth", default_value="8"),
+            DeclareLaunchArgument("stream_epoch", default_value="0"),
             DeclareLaunchArgument("raw_recording_enabled", default_value="false"),
             DeclareLaunchArgument("raw_recording_auto_start", default_value="true"),
             DeclareLaunchArgument("raw_recording_dir", default_value=""),

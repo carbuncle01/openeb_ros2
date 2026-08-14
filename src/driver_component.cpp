@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -61,6 +62,13 @@ diagnostic_msgs::msg::KeyValue make_key_value(
   return diagnostic_value;
 }
 
+template<typename Rep, typename Period>
+std::int64_t to_nanoseconds(
+  const std::chrono::duration<Rep, Period> & duration)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+}
+
 diagnostic_msgs::msg::KeyValue make_key_value(
   std::string key, const double value)
 {
@@ -103,6 +111,9 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   device_format_ = declare_parameter<std::string>("device_format", "");
   encoding_ = to_lower(declare_parameter<std::string>("encoding", "evt3"));
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
+  timing_enabled_ = declare_parameter<bool>("timing_enabled", false);
+  timing_topic_ = declare_parameter<std::string>("timing_topic", "packet_timing");
+  const auto stream_epoch = declare_parameter<std::int64_t>("stream_epoch", 0);
   raw_recording_enabled_ =
     declare_parameter<bool>("raw_recording_enabled", false);
   raw_recording_auto_start_ =
@@ -119,6 +130,8 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
     declare_parameter<std::int64_t>("packet_size_bytes", 1000000);
   const auto publisher_depth =
     declare_parameter<std::int64_t>("publisher_depth", 8);
+  const auto timing_publisher_depth =
+    declare_parameter<std::int64_t>("timing_publisher_depth", 8);
   statistics_interval_s_ =
     declare_parameter<double>("statistics_interval_s", 1.0);
   debug_ = declare_parameter<bool>("debug", false);
@@ -135,6 +148,19 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   if (publisher_depth <= 0) {
     throw std::invalid_argument("publisher_depth must be positive");
   }
+  if (timing_enabled_ && timing_topic_.empty()) {
+    throw std::invalid_argument("timing_topic must not be empty when timing is enabled");
+  }
+  if (timing_publisher_depth <= 0) {
+    throw std::invalid_argument("timing_publisher_depth must be positive");
+  }
+  if (
+    stream_epoch < 0 ||
+    static_cast<std::uint64_t>(stream_epoch) >
+    std::numeric_limits<std::uint32_t>::max())
+  {
+    throw std::invalid_argument("stream_epoch must fit in uint32");
+  }
   if (statistics_interval_s_ < 0.0) {
     throw std::invalid_argument("statistics_interval_s must be non-negative");
   }
@@ -148,12 +174,20 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   }
 
   packet_size_bytes_ = static_cast<std::size_t>(packet_size);
+  stream_epoch_ = static_cast<std::uint32_t>(stream_epoch);
 
   const auto qos = rclcpp::QoS(rclcpp::KeepLast(
       static_cast<std::size_t>(publisher_depth)))
                      .best_effort()
                      .durability_volatile();
   event_publisher_ = create_publisher<EventPacket>("events_raw", qos);
+  if (timing_enabled_) {
+    const auto timing_qos = rclcpp::QoS(rclcpp::KeepLast(
+        static_cast<std::size_t>(timing_publisher_depth)))
+                              .best_effort()
+                              .durability_volatile();
+    timing_publisher_ = create_publisher<PacketTiming>(timing_topic_, timing_qos);
+  }
   const auto diagnostics_qos = rclcpp::QoS(rclcpp::KeepLast(1))
                                  .reliable()
                                  .durability_volatile();
@@ -266,6 +300,7 @@ void DriverComponent::stop_camera() noexcept
   }
 
   pending_packet_.reset();
+  pending_timing_.reset();
   camera_open_ = false;
 }
 
@@ -434,10 +469,14 @@ void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t s
   }
 
   const auto callback_start = std::chrono::steady_clock::now();
+  const auto callback_system = timing_enabled_ ?
+    std::chrono::system_clock::now() :
+    std::chrono::system_clock::time_point{};
 
   if (!has_output_subscribers()) {
     no_subscriber_callbacks_.fetch_add(1, std::memory_order_relaxed);
     pending_packet_.reset();
+    pending_timing_.reset();
     pending_bytes_.store(0, std::memory_order_relaxed);
     record_raw_callback(callback_start, size);
     return;
@@ -454,12 +493,32 @@ void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t s
     pending_packet_->width = width_;
     pending_packet_->height = height_;
     pending_packet_->events.reserve(reserve_size_);
+
+    if (timing_enabled_) {
+      pending_timing_ = std::make_unique<PacketTiming>();
+      pending_timing_->schema_version = PacketTiming::SCHEMA_VERSION;
+      pending_timing_->packet_header = pending_packet_->header;
+      pending_timing_->sequence = pending_packet_->seq;
+      pending_timing_->stream_epoch = stream_epoch_;
+      pending_timing_->first_receive_steady_ns =
+        to_nanoseconds(callback_start.time_since_epoch());
+      pending_timing_->first_receive_system_ns =
+        to_nanoseconds(callback_system.time_since_epoch());
+    }
   }
 
   pending_packet_->events.insert(
     pending_packet_->events.end(), data, data + size);
   pending_bytes_.store(
     pending_packet_->events.size(), std::memory_order_relaxed);
+  if (pending_timing_) {
+    pending_timing_->last_receive_steady_ns =
+      to_nanoseconds(callback_start.time_since_epoch());
+    pending_timing_->last_receive_system_ns =
+      to_nanoseconds(callback_system.time_since_epoch());
+    ++pending_timing_->callback_count;
+    pending_timing_->packet_bytes = pending_packet_->events.size();
+  }
 
   const bool duration_reached =
     packet_duration_us_ == 0 || !has_published_ ||
@@ -486,7 +545,18 @@ void DriverComponent::publish_pending_packet(
   reserve_size_ = std::max(reserve_size_, packet_bytes);
   published_messages_.fetch_add(1, std::memory_order_relaxed);
   published_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
+  if (pending_timing_) {
+    const auto event_publish_steady = std::chrono::steady_clock::now();
+    const auto event_publish_system = std::chrono::system_clock::now();
+    pending_timing_->event_publish_steady_ns =
+      to_nanoseconds(event_publish_steady.time_since_epoch());
+    pending_timing_->event_publish_system_ns =
+      to_nanoseconds(event_publish_system.time_since_epoch());
+  }
   event_publisher_->publish(std::move(pending_packet_));
+  if (pending_timing_) {
+    timing_publisher_->publish(std::move(pending_timing_));
+  }
   pending_bytes_.store(0, std::memory_order_relaxed);
   last_publish_time_ = publish_time;
   has_published_ = true;
@@ -613,6 +683,8 @@ void DriverComponent::print_statistics()
       make_key_value("interarrival_mean_us", interarrival_mean_us),
       make_key_value("interarrival_max_us", interarrival_max_ns / ns_per_us),
       make_key_value("no_subscriber", no_subscriber),
+      make_key_value("timing_enabled", timing_enabled_),
+      make_key_value("stream_epoch", static_cast<std::uint64_t>(stream_epoch_)),
       make_key_value("raw_recording_enabled", raw_recording_enabled_),
       make_key_value("raw_recording_auto_start", raw_recording_auto_start_),
       make_key_value("raw_recording_active", raw_recording_active),

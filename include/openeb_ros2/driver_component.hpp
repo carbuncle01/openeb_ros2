@@ -13,6 +13,7 @@
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_msgs/msg/event_packet.hpp>
 #include <metavision/sdk/stream/camera.h>
+#include <openeb_ros2/msg/packet_timing.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -27,6 +28,7 @@ public:
 
 private:
   using EventPacket = event_camera_msgs::msg::EventPacket;
+  using PacketTiming = openeb_ros2::msg::PacketTiming;
   using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
   using Trigger = std_srvs::srv::Trigger;
 
@@ -61,17 +63,20 @@ private:
   bool runtime_error_callback_active_{false};
 
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
+  rclcpp::Publisher<PacketTiming>::SharedPtr timing_publisher_;
   rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::Service<Trigger>::SharedPtr start_raw_recording_service_;
   rclcpp::Service<Trigger>::SharedPtr stop_raw_recording_service_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
   rclcpp::TimerBase::SharedPtr raw_recording_split_timer_;
   EventPacket::UniquePtr pending_packet_;
+  PacketTiming::UniquePtr pending_timing_;
 
   std::string serial_;
   std::string device_format_;
   std::string encoding_;
   std::string frame_id_;
+  std::string timing_topic_;
   std::string raw_recording_dir_;
   std::string raw_recording_basename_;
   std::int64_t packet_duration_us_{1000};
@@ -81,9 +86,11 @@ private:
   std::uint64_t raw_recording_index_{0};
   std::uint32_t width_{0};
   std::uint32_t height_{0};
+  std::uint32_t stream_epoch_{0};
   double statistics_interval_s_{1.0};
   double raw_recording_split_duration_s_{0.0};
   bool debug_{false};
+  bool timing_enabled_{false};
   bool raw_recording_enabled_{false};
   bool raw_recording_auto_start_{true};
   bool raw_recording_active_{false};
