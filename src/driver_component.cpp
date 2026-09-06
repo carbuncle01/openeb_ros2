@@ -17,6 +17,7 @@
 #include <system_error>
 #include <utility>
 
+#include <metavision/hal/facilities/i_ll_biases.h>
 #include <metavision/hal/utils/device_config.h>
 #include <rclcpp_components/register_node_macro.hpp>
 
@@ -153,6 +154,10 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
 {
   serial_ = declare_parameter<std::string>("serial", "");
   device_format_ = declare_parameter<std::string>("device_format", "");
+  rcl_interfaces::msg::ParameterDescriptor bias_file_descriptor;
+  bias_file_descriptor.description = "Metavision .bias file applied before camera start";
+  bias_file_descriptor.read_only = true;
+  bias_file_ = declare_parameter<std::string>("bias_file", "", bias_file_descriptor);
   encoding_ = to_lower(declare_parameter<std::string>("encoding", "evt3"));
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
   raw_recording_enabled_ =
@@ -268,6 +273,16 @@ void DriverComponent::open_camera()
     Metavision::Camera::from_first_available(config) :
     Metavision::Camera::from_serial(serial_, config);
   camera_open_ = true;
+
+  if (!bias_file_.empty()) {
+    try {
+      camera_.get_facility<Metavision::I_LL_Biases>().load_from_file(bias_file_);
+    } catch (const std::exception & error) {
+      throw std::runtime_error(
+        "Failed to load bias_file '" + bias_file_ + "': " + error.what());
+    }
+    RCLCPP_INFO(get_logger(), "Loaded camera biases from %s", bias_file_.c_str());
+  }
 
   const auto & geometry = camera_.geometry();
   width_ = static_cast<std::uint32_t>(geometry.get_width());

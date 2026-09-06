@@ -22,6 +22,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("namespace", default_value="event_camera"),
             DeclareLaunchArgument("serial", default_value=""),
+            DeclareLaunchArgument("bias_file", default_value=""),
             DeclareLaunchArgument("device_format", default_value=""),
             DeclareLaunchArgument("frame_id", default_value="event_camera"),
             DeclareLaunchArgument("raw_recording_enabled", default_value="false"),
@@ -46,6 +47,9 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial": LaunchConfiguration("serial"),
+                        "bias_file": ParameterValue(
+                            LaunchConfiguration("bias_file"), value_type=str
+                        ),
                         "device_format": LaunchConfiguration("device_format"),
                         "frame_id": LaunchConfiguration("frame_id"),
                         "raw_recording_enabled": raw_recording_enabled,

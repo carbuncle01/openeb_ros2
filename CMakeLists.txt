@@ -24,6 +24,7 @@ find_package(std_srvs REQUIRED)
 # JetPilot uses the CenturyArks SilkyEvCam-enabled OpenEB/Metavision SDK
 # installed under /usr/local.
 find_package(MetavisionSDK COMPONENTS base core stream REQUIRED)
+find_package(MetavisionHAL REQUIRED)
 
 add_library(openeb_driver_component SHARED
   src/driver_component.cpp
@@ -42,6 +43,7 @@ ament_target_dependencies(openeb_driver_component
   std_srvs
 )
 target_link_libraries(openeb_driver_component
+  Metavision::HAL
   MetavisionSDK::base
   MetavisionSDK::core
   MetavisionSDK::stream

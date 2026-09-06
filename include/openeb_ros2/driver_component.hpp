@@ -78,6 +78,7 @@ private:
 
   std::string serial_;
   std::string device_format_;
+  std::string bias_file_;
   std::string encoding_;
   std::string frame_id_;
   std::string raw_recording_request_topic_;

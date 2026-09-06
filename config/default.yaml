@@ -2,6 +2,7 @@
   ros__parameters:
     serial: ""
     device_format: ""
+    bias_file: ""  # Metavision .bias file; empty preserves camera defaults
     encoding: "evt3"
     frame_id: "event_camera"
     raw_recording_enabled: false

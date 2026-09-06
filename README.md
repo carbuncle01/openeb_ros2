@@ -36,6 +36,19 @@ build under `/usr/local`.
 
 ## Run
 
+Apply a Metavision `.bias` file saved by the SilkyEvCam bias tuner:
+
+```bash
+ros2 launch openeb_ros2 pipeline.launch.py bias_file:=/absolute/path/to/camera.bias
+```
+
+`driver.launch.py` and `composed.launch.py` accept the same `bias_file` argument.
+The driver loads it through `I_LL_Biases` before RAW recording or streaming starts.
+An empty path (the default) leaves the camera biases unchanged. SDK load errors
+abort startup with the file path and error reason. This is a read-only startup
+parameter; restart the driver to apply another file. When running in Docker,
+use a path visible inside the container. Close the tuner before starting ROS.
+
 Run the driver only:
 
 ```bash
