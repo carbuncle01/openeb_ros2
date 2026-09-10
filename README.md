@@ -160,6 +160,24 @@ receive both polarities within one frame become magenta. A lower-bandwidth
 ros2 launch openeb_ros2 composed.launch.py event_image_encoding:=mono8
 ```
 
+`event_image_style:=gep` switches the BGR publisher to EventState/GEP-compatible
+three-channel frames: white background, OFF=red, ON=blue, dominant polarity at
+overlapping pixels, and separate count clipping/scaling for each polarity. The
+scaling percentile defaults to 90 and can be changed with
+`event_image_percentile`. GEP style requires `bgr8`.
+
+```bash
+ros2 launch openeb_ros2 composed.launch.py \
+  event_image_style:=gep \
+  event_image_percentile:=90.0 \
+  event_image_fps:=20.0
+```
+
+The `event-camera` JetPilot sensor profile selects these values by default.
+Its 20 Hz window matches the approximate RGB interval used by EventState's
+default DSEC representation. Keep the window rate equal between data recording,
+JetPilot fine-tuning, and deployment.
+
 Set `event_image_enabled:=false` to disable the image publisher entirely.
 The default `event_image_fps` is 25 Hz. Each image accumulates events decoded
 between wall-clock image timer ticks; its actual frequency and timer cost are
@@ -181,6 +199,30 @@ interactive debugging is useful:
 ```bash
 ros2 launch openeb_ros2 composed.launch.py debug:=true
 ```
+
+It can also be toggled while the node is running:
+
+```bash
+ros2 param set /event_camera/event_preprocessor debug true
+ros2 param set /event_camera/event_preprocessor debug false
+```
+
+GEP mode adds the following fields to `preprocessor_stats`:
+
+- `gep_preprocess_mean_us` / `gep_preprocess_max_us`: complete count
+  accumulation and any frame rendering triggered by one decoded packet
+- `gep_preprocess_busy_pct`: fraction of wall time occupied by that work
+- `gep_render_mean_us` / `gep_render_max_us`: percentile calculation, BGR image
+  construction, and publisher call for one generated frame
+- `gep_preprocess_calls` / `gep_render_calls`: denominators for the interval
+
+`decode_mean_us` / `decode_max_us` stop at EVT3 decoding and exclude GEP
+accumulation/rendering. `callback_mean_us` / `callback_max_us` remain the
+end-to-end packet callback cost including both stages.
+
+The diagnostics topic remains available regardless of `debug`. The switch only
+controls periodic terminal logs, so timing collection can remain enabled in a
+recorded run without flooding the console.
 
 For offline debugging, record diagnostics together with the event streams:
 
@@ -212,6 +254,7 @@ The preprocessor reports:
 - decoded event rate and mean/maximum decode time
 - decode cost normalized per event
 - event-image frequency, bandwidth, events per image, and timer cost
+- GEP accumulation/render mean, maximum, busy percentage, and call counts
 - empty, unexpected-encoding, and no-subscriber discard counts
 
 Diagnostic status names end with `driver_stats` and `preprocessor_stats`.

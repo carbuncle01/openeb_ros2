@@ -9,6 +9,7 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
 #include <utility>
@@ -78,6 +79,10 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     declare_parameter<double>("event_image_fps", 25.0);
   event_image_encoding_ =
     declare_parameter<std::string>("event_image_encoding", "bgr8");
+  event_image_style_ =
+    declare_parameter<std::string>("event_image_style", "dark");
+  event_image_percentile_ =
+    declare_parameter<double>("event_image_percentile", 90.0);
   event_image_publish_empty_ =
     declare_parameter<bool>("event_image_publish_empty", true);
   debug_ = declare_parameter<bool>("debug", false);
@@ -109,6 +114,18 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
   {
     throw std::invalid_argument(
       "event_image_encoding must be either 'bgr8' or 'mono8'");
+  }
+  if (event_image_style_ != "dark" && event_image_style_ != "gep") {
+    throw std::invalid_argument("event_image_style must be either 'dark' or 'gep'");
+  }
+  if (event_image_style_ == "gep" && event_image_encoding_ != "bgr8") {
+    throw std::invalid_argument("event_image_style='gep' requires event_image_encoding='bgr8'");
+  }
+  if (
+    !std::isfinite(event_image_percentile_) ||
+    event_image_percentile_ <= 0.0 || event_image_percentile_ > 100.0)
+  {
+    throw std::invalid_argument("event_image_percentile must be in (0, 100]");
   }
   if (statistics_interval_s_ < 0.0) {
     throw std::invalid_argument("statistics_interval_s must be non-negative");
@@ -193,9 +210,10 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
       if (has_subscribers) {
         RCLCPP_INFO(
           get_logger(),
-          "Event image output enabled for subscriber (%ux%u, encoding=%s, fps=%.1f)",
+          "Event image output enabled for subscriber "
+          "(%ux%u, encoding=%s, style=%s, fps=%.1f)",
           event_image_width_, event_image_height_,
-          event_image_encoding_.c_str(), event_image_fps_);
+          event_image_encoding_.c_str(), event_image_style_.c_str(), event_image_fps_);
         start_or_update_frame_generator();
       } else {
         RCLCPP_INFO(get_logger(), "Event image output paused: no subscribers");
@@ -272,7 +290,7 @@ void PreprocessorComponent::eventCD(
   const std::uint8_t polarity)
 {
   ++decoded_events_in_packet_;
-  if (!frame_generation_algo_) {
+  if (!frame_generation_algo_ && event_image_style_ != "gep") {
     return;
   }
   if (x >= event_image_width_ || y >= event_image_height_) {
@@ -338,10 +356,6 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
     return;
   }
 
-  if (frame_generation_algo_ && !cd_buffer_.empty()) {
-    frame_generation_algo_->process_events(cd_buffer_.cbegin(), cd_buffer_.cend());
-  }
-
   const auto decode_ns = static_cast<std::uint64_t>(
     std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - decode_start).count());
@@ -352,6 +366,147 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
   decode_calls_.fetch_add(1, std::memory_order_relaxed);
   decode_time_ns_.fetch_add(decode_ns, std::memory_order_relaxed);
   update_max(decode_time_max_ns_, decode_ns);
+
+  if (event_image_style_ == "gep") {
+    process_gep_events(cd_buffer_);
+  } else if (frame_generation_algo_ && !cd_buffer_.empty()) {
+    frame_generation_algo_->process_events(cd_buffer_.cbegin(), cd_buffer_.cend());
+  }
+}
+
+namespace
+{
+
+float percentile_scale(
+  const std::vector<std::uint32_t> & counts, const double percentile)
+{
+  std::vector<std::uint32_t> nonzero;
+  nonzero.reserve(counts.size());
+  for (const auto count : counts) {
+    if (count > 0U) {
+      nonzero.push_back(count);
+    }
+  }
+  if (nonzero.empty()) {
+    return 1.0F;
+  }
+  std::sort(nonzero.begin(), nonzero.end());
+  const double position =
+    (static_cast<double>(nonzero.size()) - 1.0) * percentile / 100.0;
+  const auto lower = static_cast<std::size_t>(std::floor(position));
+  const auto upper = static_cast<std::size_t>(std::ceil(position));
+  const double fraction = position - static_cast<double>(lower);
+  const double value =
+    static_cast<double>(nonzero[lower]) * (1.0 - fraction) +
+    static_cast<double>(nonzero[upper]) * fraction;
+  return static_cast<float>(std::max(1.0, value));
+}
+
+std::uint8_t gep_channel(const float value)
+{
+  return static_cast<std::uint8_t>(
+    std::lround(std::clamp(value, 0.0F, 1.0F) * 255.0F));
+}
+
+}  // namespace
+
+void PreprocessorComponent::process_gep_events(
+  const std::vector<Metavision::EventCD> & events)
+{
+  if (events.empty() || event_image_width_ == 0 || event_image_height_ == 0) {
+    return;
+  }
+  const auto preprocess_start = std::chrono::steady_clock::now();
+  const auto duration_us = static_cast<Metavision::timestamp>(
+    std::max(1.0, std::round(1000000.0 / event_image_fps_)));
+  if (gep_positive_counts_.empty()) {
+    const auto pixels = static_cast<std::size_t>(event_image_width_) * event_image_height_;
+    gep_positive_counts_.assign(pixels, 0U);
+    gep_negative_counts_.assign(pixels, 0U);
+  }
+
+  for (const auto & event : events) {
+    if (gep_window_end_us_ == 0 || event.t < gep_window_start_us_) {
+      std::fill(gep_positive_counts_.begin(), gep_positive_counts_.end(), 0U);
+      std::fill(gep_negative_counts_.begin(), gep_negative_counts_.end(), 0U);
+      gep_window_start_us_ = event.t;
+      gep_window_end_us_ = event.t + duration_us;
+    }
+    while (event.t > gep_window_end_us_) {
+      publish_gep_frame(gep_window_end_us_);
+      gep_window_start_us_ = gep_window_end_us_;
+      gep_window_end_us_ += duration_us;
+    }
+    if (event.x >= event_image_width_ || event.y >= event_image_height_) {
+      continue;
+    }
+    const auto index =
+      static_cast<std::size_t>(event.y) * event_image_width_ + event.x;
+    auto & count = event.p ? gep_positive_counts_[index] : gep_negative_counts_[index];
+    if (count < std::numeric_limits<std::uint32_t>::max()) {
+      ++count;
+    }
+  }
+  const auto preprocess_ns = static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - preprocess_start).count());
+  gep_preprocess_calls_.fetch_add(1, std::memory_order_relaxed);
+  gep_preprocess_time_ns_.fetch_add(preprocess_ns, std::memory_order_relaxed);
+  update_max(gep_preprocess_time_max_ns_, preprocess_ns);
+}
+
+void PreprocessorComponent::publish_gep_frame(
+  const Metavision::timestamp timestamp_us)
+{
+  const auto total_events = std::accumulate(
+    gep_positive_counts_.begin(), gep_positive_counts_.end(), std::uint64_t{0}) +
+    std::accumulate(
+    gep_negative_counts_.begin(), gep_negative_counts_.end(), std::uint64_t{0});
+  if (total_events == 0U && !event_image_publish_empty_) {
+    return;
+  }
+  const auto render_start = std::chrono::steady_clock::now();
+
+  const float positive_scale =
+    percentile_scale(gep_positive_counts_, event_image_percentile_);
+  const float negative_scale =
+    percentile_scale(gep_negative_counts_, event_image_percentile_);
+  auto message = std::make_unique<sensor_msgs::msg::Image>();
+  message->header.stamp.sec = static_cast<std::int32_t>(timestamp_us / 1000000LL);
+  message->header.stamp.nanosec =
+    static_cast<std::uint32_t>((timestamp_us % 1000000LL) * 1000ULL);
+  message->header.frame_id = event_image_frame_id_;
+  message->height = event_image_height_;
+  message->width = event_image_width_;
+  message->encoding = "bgr8";
+  message->is_bigendian = false;
+  message->step = event_image_width_ * 3U;
+  message->data.resize(message->step * event_image_height_, 255U);
+
+  for (std::size_t index = 0; index < gep_positive_counts_.size(); ++index) {
+    const float positive = std::min(1.0F, gep_positive_counts_[index] / positive_scale);
+    const float negative = std::min(1.0F, gep_negative_counts_[index] / negative_scale);
+    const bool positive_dominates = positive >= negative;
+    const float selected_positive = positive_dominates ? positive : 0.0F;
+    const float selected_negative = positive_dominates ? 0.0F : negative;
+    message->data[index * 3U] = gep_channel(1.0F - selected_negative);
+    message->data[index * 3U + 1U] =
+      gep_channel(1.0F - selected_negative - selected_positive);
+    message->data[index * 3U + 2U] = gep_channel(1.0F - selected_positive);
+  }
+
+  image_published_messages_.fetch_add(1, std::memory_order_relaxed);
+  image_published_bytes_.fetch_add(message->data.size(), std::memory_order_relaxed);
+  image_published_events_.fetch_add(total_events, std::memory_order_relaxed);
+  event_image_publisher_->publish(std::move(message));
+  const auto render_ns = static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - render_start).count());
+  gep_render_calls_.fetch_add(1, std::memory_order_relaxed);
+  gep_render_time_ns_.fetch_add(render_ns, std::memory_order_relaxed);
+  update_max(gep_render_time_max_ns_, render_ns);
+  std::fill(gep_positive_counts_.begin(), gep_positive_counts_.end(), 0U);
+  std::fill(gep_negative_counts_.begin(), gep_negative_counts_.end(), 0U);
 }
 
 void PreprocessorComponent::on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame)
@@ -407,6 +562,16 @@ void PreprocessorComponent::start_or_update_frame_generator()
   const std::uint32_t acc_us = (event_image_fps_ > 0.0) ?
     static_cast<std::uint32_t>(1000000.0 / event_image_fps_) : 40000U;
 
+  if (event_image_style_ == "gep") {
+    frame_generation_algo_.reset();
+    const auto pixels = static_cast<std::size_t>(event_image_width_) * event_image_height_;
+    gep_positive_counts_.assign(pixels, 0U);
+    gep_negative_counts_.assign(pixels, 0U);
+    gep_window_start_us_ = 0;
+    gep_window_end_us_ = 0;
+    return;
+  }
+
   frame_generation_algo_ = std::make_unique<Metavision::PeriodicFrameGenerationAlgorithm>(
     event_image_width_, event_image_height_, acc_us, event_image_fps_);
 
@@ -426,6 +591,10 @@ void PreprocessorComponent::reset_event_image_decoder()
 {
   frame_generation_algo_.reset();
   cd_buffer_.clear();
+  gep_positive_counts_.clear();
+  gep_negative_counts_.clear();
+  gep_window_start_us_ = 0;
+  gep_window_end_us_ = 0;
   event_decoder_factory_ = std::make_unique<EventDecoderFactory>();
   decoded_events_in_packet_ = 0;
   out_of_bounds_events_in_packet_ = 0;
@@ -457,6 +626,9 @@ void PreprocessorComponent::record_callback_time(
 
 void PreprocessorComponent::print_statistics()
 {
+  // Refresh the declared parameter so `ros2 param set ... debug true/false`
+  // can toggle periodic logs without restarting the camera pipeline.
+  debug_ = get_parameter("debug").as_bool();
   const auto statistics_time = std::chrono::steady_clock::now();
   const auto elapsed_s =
     std::chrono::duration<double>(statistics_time - last_statistics_time_).count();
@@ -515,6 +687,18 @@ void PreprocessorComponent::print_statistics()
     image_timer_time_max_ns_.exchange(0, std::memory_order_relaxed);
   const auto image_no_subscriber_packets =
     image_no_subscriber_packets_.exchange(0, std::memory_order_relaxed);
+  const auto gep_preprocess_calls =
+    gep_preprocess_calls_.exchange(0, std::memory_order_relaxed);
+  const auto gep_preprocess_ns =
+    gep_preprocess_time_ns_.exchange(0, std::memory_order_relaxed);
+  const auto gep_preprocess_max_ns =
+    gep_preprocess_time_max_ns_.exchange(0, std::memory_order_relaxed);
+  const auto gep_render_calls =
+    gep_render_calls_.exchange(0, std::memory_order_relaxed);
+  const auto gep_render_ns =
+    gep_render_time_ns_.exchange(0, std::memory_order_relaxed);
+  const auto gep_render_max_ns =
+    gep_render_time_max_ns_.exchange(0, std::memory_order_relaxed);
 
   constexpr double bytes_per_mib = 1024.0 * 1024.0;
   constexpr double bytes_per_kib = 1024.0;
@@ -555,6 +739,14 @@ void PreprocessorComponent::print_statistics()
   const double image_timer_mean_us =
     image_timer_calls == 0 ? 0.0 :
     static_cast<double>(image_timer_ns) / image_timer_calls / ns_per_us;
+  const double gep_preprocess_mean_us =
+    gep_preprocess_calls == 0 ? 0.0 :
+    static_cast<double>(gep_preprocess_ns) / gep_preprocess_calls / ns_per_us;
+  const double gep_preprocess_busy_pct =
+    static_cast<double>(gep_preprocess_ns) / (elapsed_s * 1.0e9) * 100.0;
+  const double gep_render_mean_us =
+    gep_render_calls == 0 ? 0.0 :
+    static_cast<double>(gep_render_ns) / gep_render_calls / ns_per_us;
 
   const bool publish_diagnostics =
     diagnostics_publisher_->get_subscription_count() > 0 ||
@@ -594,6 +786,14 @@ void PreprocessorComponent::print_statistics()
       make_key_value("events_per_image", events_per_image),
       make_key_value("image_timer_mean_us", image_timer_mean_us),
       make_key_value("image_timer_max_us", image_timer_max_ns / ns_per_us),
+      make_key_value("event_image_style", event_image_style_),
+      make_key_value("gep_preprocess_calls", gep_preprocess_calls),
+      make_key_value("gep_preprocess_mean_us", gep_preprocess_mean_us),
+      make_key_value("gep_preprocess_max_us", gep_preprocess_max_ns / ns_per_us),
+      make_key_value("gep_preprocess_busy_pct", gep_preprocess_busy_pct),
+      make_key_value("gep_render_calls", gep_render_calls),
+      make_key_value("gep_render_mean_us", gep_render_mean_us),
+      make_key_value("gep_render_max_us", gep_render_max_ns / ns_per_us),
       make_key_value("dropped_empty", dropped_empty),
       make_key_value("dropped_encoding", dropped_encoding),
       make_key_value("no_subscriber", no_subscriber),
@@ -619,7 +819,10 @@ void PreprocessorComponent::print_statistics()
       "decoded_mev_s=%.3f decode_mean_us=%.2f decode_max_us=%.2f "
       "decode_ns_per_event=%.2f image_hz=%.1f image_mib_s=%.3f "
       "events_per_image=%.1f image_timer_mean_us=%.2f "
-      "image_timer_max_us=%.2f dropped_empty=%llu dropped_encoding=%llu "
+      "image_timer_max_us=%.2f gep_preprocess_mean_us=%.2f "
+      "gep_preprocess_max_us=%.2f gep_preprocess_busy_pct=%.2f "
+      "gep_render_mean_us=%.2f gep_render_max_us=%.2f "
+      "dropped_empty=%llu dropped_encoding=%llu "
       "no_subscriber=%llu image_no_subscriber=%llu decode_errors=%llu "
       "out_of_bounds_events=%llu",
       receive_hz, receive_mib_s, average_packet_kib, publish_hz,
@@ -629,6 +832,8 @@ void PreprocessorComponent::print_statistics()
       decode_max_ns / ns_per_us, decode_ns_per_event, image_hz,
       image_mib_s, events_per_image, image_timer_mean_us,
       image_timer_max_ns / ns_per_us,
+      gep_preprocess_mean_us, gep_preprocess_max_ns / ns_per_us,
+      gep_preprocess_busy_pct, gep_render_mean_us, gep_render_max_ns / ns_per_us,
       static_cast<unsigned long long>(dropped_empty),
       static_cast<unsigned long long>(dropped_encoding),
       static_cast<unsigned long long>(no_subscriber),

@@ -28,6 +28,8 @@
     event_image_enabled: true
     event_image_fps: 25.0
     event_image_encoding: "bgr8"
+    event_image_style: "dark"
+    event_image_percentile: 90.0
     event_image_publish_empty: true
     event_image_publisher_depth: 2
     statistics_interval_s: 1.0

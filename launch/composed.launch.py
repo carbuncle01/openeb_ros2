@@ -90,6 +90,10 @@ def generate_launch_description():
                         "event_image_encoding": LaunchConfiguration(
                             "event_image_encoding"
                         ),
+                        "event_image_style": LaunchConfiguration("event_image_style"),
+                        "event_image_percentile": ParameterValue(
+                            LaunchConfiguration("event_image_percentile"), value_type=float
+                        ),
                         "event_image_publish_empty": event_image_publish_empty,
                         "event_image_publisher_depth": event_image_publisher_depth,
                     }
@@ -123,6 +127,8 @@ def generate_launch_description():
             DeclareLaunchArgument("event_image_enabled", default_value="true"),
             DeclareLaunchArgument("event_image_fps", default_value="25.0"),
             DeclareLaunchArgument("event_image_encoding", default_value="bgr8"),
+            DeclareLaunchArgument("event_image_style", default_value="dark"),
+            DeclareLaunchArgument("event_image_percentile", default_value="90.0"),
             DeclareLaunchArgument(
                 "event_image_publish_empty", default_value="true"
             ),

@@ -47,6 +47,8 @@ private:
   void on_packet(EventPacket::UniquePtr packet);
   bool preprocess(EventPacket & packet);
   void decode_for_event_image(const EventPacket & packet);
+  void process_gep_events(const std::vector<Metavision::EventCD> & events);
+  void publish_gep_frame(Metavision::timestamp timestamp_us);
   void on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame);
   void start_or_update_frame_generator();
   void reset_event_image_decoder();
@@ -68,6 +70,7 @@ private:
   std::string expected_encoding_;
   std::string output_frame_id_;
   std::string event_image_encoding_;
+  std::string event_image_style_;
   std::string event_image_frame_id_;
   bool drop_empty_packets_{true};
   bool drop_unexpected_encoding_{true};
@@ -76,11 +79,16 @@ private:
   bool event_image_subscriber_active_{false};
   bool debug_{false};
   double event_image_fps_{25.0};
+  double event_image_percentile_{90.0};
   double statistics_interval_s_{1.0};
   std::uint32_t event_image_width_{0};
   std::uint32_t event_image_height_{0};
   std::uint32_t event_image_channels_{3};
   std::uint8_t event_image_background_value_{0};
+  Metavision::timestamp gep_window_start_us_{0};
+  Metavision::timestamp gep_window_end_us_{0};
+  std::vector<std::uint32_t> gep_positive_counts_;
+  std::vector<std::uint32_t> gep_negative_counts_;
   std::uint64_t decoded_events_in_packet_{0};
   std::uint64_t out_of_bounds_events_in_packet_{0};
   std::uint64_t events_in_active_image_{0};
@@ -111,6 +119,12 @@ private:
   std::atomic<std::uint64_t> image_timer_time_ns_{0};
   std::atomic<std::uint64_t> image_timer_time_max_ns_{0};
   std::atomic<std::uint64_t> image_no_subscriber_packets_{0};
+  std::atomic<std::uint64_t> gep_preprocess_calls_{0};
+  std::atomic<std::uint64_t> gep_preprocess_time_ns_{0};
+  std::atomic<std::uint64_t> gep_preprocess_time_max_ns_{0};
+  std::atomic<std::uint64_t> gep_render_calls_{0};
+  std::atomic<std::uint64_t> gep_render_time_ns_{0};
+  std::atomic<std::uint64_t> gep_render_time_max_ns_{0};
 };
 
 }  // namespace openeb_ros2
