@@ -27,6 +27,9 @@
     publisher_depth: 8
     event_image_enabled: true
     event_image_fps: 25.0
+    # Zero keeps the legacy behavior: both values become 1000 / event_image_fps.
+    event_image_window_ms: 0.0
+    event_image_stride_ms: 0.0
     event_image_encoding: "bgr8"
     event_image_style: "dark"
     event_image_percentile: 90.0

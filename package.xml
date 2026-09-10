@@ -16,6 +16,7 @@
   <depend>event_camera_msgs</depend>
   <depend>jetpilot_msgs</depend>
   <depend>diagnostic_msgs</depend>
+  <depend>rcl_interfaces</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
   <depend>sensor_msgs</depend>

@@ -16,6 +16,7 @@ find_package(diagnostic_msgs REQUIRED)
 find_package(event_camera_codecs REQUIRED)
 find_package(event_camera_msgs REQUIRED)
 find_package(jetpilot_msgs REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -64,6 +65,7 @@ ament_target_dependencies(openeb_preprocessor_component
   diagnostic_msgs
   event_camera_codecs
   event_camera_msgs
+  rcl_interfaces
   rclcpp
   rclcpp_components
   sensor_msgs
@@ -121,6 +123,7 @@ ament_export_dependencies(
   event_camera_codecs
   event_camera_msgs
   jetpilot_msgs
+  rcl_interfaces
   rclcpp
   rclcpp_components
   sensor_msgs

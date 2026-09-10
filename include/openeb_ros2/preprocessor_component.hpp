@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include <metavision/sdk/base/events/event_cd.h>
 #include <metavision/sdk/core/algorithms/periodic_frame_generation_algorithm.h>
 #include <opencv2/core/mat.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
@@ -49,6 +52,7 @@ private:
   void decode_for_event_image(const EventPacket & packet);
   void process_gep_events(const std::vector<Metavision::EventCD> & events);
   void publish_gep_frame(Metavision::timestamp timestamp_us);
+  void evict_gep_events(Metavision::timestamp window_start_us);
   void on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame);
   void start_or_update_frame_generator();
   void reset_event_image_decoder();
@@ -57,12 +61,16 @@ private:
   void record_callback_time(
     const std::chrono::steady_clock::time_point & callback_start);
   void print_statistics();
+  rcl_interfaces::msg::SetParametersResult on_parameters(
+    const std::vector<rclcpp::Parameter> & parameters);
 
   rclcpp::Subscription<EventPacket>::SharedPtr event_subscription_;
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr event_image_publisher_;
   rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
+    parameter_callback_handle_;
   std::unique_ptr<EventDecoderFactory> event_decoder_factory_;
   std::unique_ptr<Metavision::PeriodicFrameGenerationAlgorithm> frame_generation_algo_;
   std::vector<Metavision::EventCD> cd_buffer_;
@@ -79,16 +87,20 @@ private:
   bool event_image_subscriber_active_{false};
   bool debug_{false};
   double event_image_fps_{25.0};
+  double event_image_window_ms_{40.0};
+  double event_image_stride_ms_{40.0};
   double event_image_percentile_{90.0};
   double statistics_interval_s_{1.0};
   std::uint32_t event_image_width_{0};
   std::uint32_t event_image_height_{0};
   std::uint32_t event_image_channels_{3};
   std::uint8_t event_image_background_value_{0};
-  Metavision::timestamp gep_window_start_us_{0};
-  Metavision::timestamp gep_window_end_us_{0};
+  Metavision::timestamp gep_next_publish_us_{0};
+  Metavision::timestamp gep_last_event_us_{0};
+  std::deque<Metavision::EventCD> gep_events_;
   std::vector<std::uint32_t> gep_positive_counts_;
   std::vector<std::uint32_t> gep_negative_counts_;
+  std::mutex event_image_mutex_;
   std::uint64_t decoded_events_in_packet_{0};
   std::uint64_t out_of_bounds_events_in_packet_{0};
   std::uint64_t events_in_active_image_{0};

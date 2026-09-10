@@ -32,6 +32,12 @@ def generate_launch_description():
     event_image_fps = ParameterValue(
         LaunchConfiguration("event_image_fps"), value_type=float
     )
+    event_image_window_ms = ParameterValue(
+        LaunchConfiguration("event_image_window_ms"), value_type=float
+    )
+    event_image_stride_ms = ParameterValue(
+        LaunchConfiguration("event_image_stride_ms"), value_type=float
+    )
     event_image_publish_empty = ParameterValue(
         LaunchConfiguration("event_image_publish_empty"), value_type=bool
     )
@@ -61,6 +67,8 @@ def generate_launch_description():
             DeclareLaunchArgument("debug", default_value="false"),
             DeclareLaunchArgument("event_image_enabled", default_value="true"),
             DeclareLaunchArgument("event_image_fps", default_value="25.0"),
+            DeclareLaunchArgument("event_image_window_ms", default_value="0.0"),
+            DeclareLaunchArgument("event_image_stride_ms", default_value="0.0"),
             DeclareLaunchArgument("event_image_encoding", default_value="bgr8"),
             DeclareLaunchArgument("event_image_style", default_value="dark"),
             DeclareLaunchArgument("event_image_percentile", default_value="90.0"),
@@ -112,6 +120,8 @@ def generate_launch_description():
                         "debug": debug,
                         "event_image_enabled": event_image_enabled,
                         "event_image_fps": event_image_fps,
+                        "event_image_window_ms": event_image_window_ms,
+                        "event_image_stride_ms": event_image_stride_ms,
                         "event_image_encoding": LaunchConfiguration(
                             "event_image_encoding"
                         ),

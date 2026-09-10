@@ -145,11 +145,27 @@ Set a camera serial number when multiple cameras are connected:
 ros2 launch openeb_ros2 composed.launch.py serial:=YOUR_SERIAL
 ```
 
-Generate images at a selected frequency:
+Generate non-overlapping images at a selected legacy frequency:
 
 ```bash
 ros2 launch openeb_ros2 composed.launch.py event_image_fps:=50.0
 ```
+
+For an explicit sliding window, configure the accumulation duration and output
+stride separately. This example retains the latest 50 ms of events and emits a
+new image every 10 ms (100 Hz, 80% overlap):
+
+```bash
+ros2 launch openeb_ros2 composed.launch.py \
+  event_image_style:=gep \
+  event_image_window_ms:=50.0 \
+  event_image_stride_ms:=10.0
+```
+
+The first image is emitted after a complete window has accumulated. Later
+images use the causal interval `(image timestamp - window, image timestamp]`.
+Both parameters can be changed atomically at runtime; changing them clears the
+active window so event counts from different timing contracts are never mixed.
 
 The image output is available from both the standalone and composable
 pipelines. `bgr8` renders ON events in blue and OFF events in red; pixels that
@@ -170,18 +186,21 @@ scaling percentile defaults to 90 and can be changed with
 ros2 launch openeb_ros2 composed.launch.py \
   event_image_style:=gep \
   event_image_percentile:=90.0 \
-  event_image_fps:=20.0
+  event_image_window_ms:=50.0 \
+  event_image_stride_ms:=10.0
 ```
 
 The `event-camera` JetPilot sensor profile selects these values by default.
-Its 20 Hz window matches the approximate RGB interval used by EventState's
-default DSEC representation. Keep the window rate equal between data recording,
-JetPilot fine-tuning, and deployment.
+Its 50 ms window matches the approximate RGB interval used by EventState's
+default DSEC representation, while its 10 ms stride refreshes the input at
+100 Hz. Keep both the window and stride equal between data recording, JetPilot
+fine-tuning, and deployment.
 
 Set `event_image_enabled:=false` to disable the image publisher entirely.
-The default `event_image_fps` is 25 Hz. Each image accumulates events decoded
-between wall-clock image timer ticks; its actual frequency and timer cost are
-reported in `preprocessor_stats`.
+For compatibility, zero-valued `event_image_window_ms` and
+`event_image_stride_ms` both resolve to `1000 / event_image_fps`. Their resolved
+values, actual image frequency, event count, and processing cost are reported
+in `preprocessor_stats`.
 
 ## Internal performance statistics
 

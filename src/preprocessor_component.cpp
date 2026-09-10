@@ -77,6 +77,10 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     declare_parameter<bool>("event_image_enabled", true);
   event_image_fps_ =
     declare_parameter<double>("event_image_fps", 25.0);
+  event_image_window_ms_ =
+    declare_parameter<double>("event_image_window_ms", 0.0);
+  event_image_stride_ms_ =
+    declare_parameter<double>("event_image_stride_ms", 0.0);
   event_image_encoding_ =
     declare_parameter<std::string>("event_image_encoding", "bgr8");
   event_image_style_ =
@@ -108,6 +112,26 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     throw std::invalid_argument(
       "event_image_fps must be finite and positive when event image output is enabled");
   }
+  if (
+    !std::isfinite(event_image_window_ms_) || event_image_window_ms_ < 0.0 ||
+    !std::isfinite(event_image_stride_ms_) || event_image_stride_ms_ < 0.0)
+  {
+    throw std::invalid_argument(
+      "event_image_window_ms and event_image_stride_ms must be finite and non-negative");
+  }
+  const double legacy_interval_ms = 1000.0 / event_image_fps_;
+  if (event_image_window_ms_ == 0.0) {
+    event_image_window_ms_ = legacy_interval_ms;
+    set_parameter(rclcpp::Parameter("event_image_window_ms", event_image_window_ms_));
+  }
+  if (event_image_stride_ms_ == 0.0) {
+    event_image_stride_ms_ = legacy_interval_ms;
+    set_parameter(rclcpp::Parameter("event_image_stride_ms", event_image_stride_ms_));
+  }
+  if (event_image_stride_ms_ > event_image_window_ms_) {
+    throw std::invalid_argument("event_image_stride_ms must not exceed event_image_window_ms");
+  }
+  event_image_fps_ = 1000.0 / event_image_stride_ms_;
   if (
     event_image_encoding_ != "bgr8" &&
     event_image_encoding_ != "mono8")
@@ -165,6 +189,10 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
       event_image_encoding_ == "bgr8" ? 0U : 127U;
   }
 
+  parameter_callback_handle_ = add_on_set_parameters_callback(
+    std::bind(
+      &PreprocessorComponent::on_parameters, this, std::placeholders::_1));
+
   last_statistics_time_ = std::chrono::steady_clock::now();
   if (statistics_interval_s_ > 0.0) {
     const auto period_ms = std::chrono::milliseconds(
@@ -203,6 +231,7 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
   }
 
   if (event_image_enabled_) {
+    const std::scoped_lock image_lock(event_image_mutex_);
     const bool has_subscribers = has_event_image_subscribers();
     if (has_subscribers != event_image_subscriber_active_) {
       event_image_subscriber_active_ = has_subscribers;
@@ -211,9 +240,10 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
         RCLCPP_INFO(
           get_logger(),
           "Event image output enabled for subscriber "
-          "(%ux%u, encoding=%s, style=%s, fps=%.1f)",
+          "(%ux%u, encoding=%s, style=%s, window=%.1fms, stride=%.1fms, fps=%.1f)",
           event_image_width_, event_image_height_,
-          event_image_encoding_.c_str(), event_image_style_.c_str(), event_image_fps_);
+          event_image_encoding_.c_str(), event_image_style_.c_str(),
+          event_image_window_ms_, event_image_stride_ms_, event_image_fps_);
         start_or_update_frame_generator();
       } else {
         RCLCPP_INFO(get_logger(), "Event image output paused: no subscribers");
@@ -417,8 +447,10 @@ void PreprocessorComponent::process_gep_events(
     return;
   }
   const auto preprocess_start = std::chrono::steady_clock::now();
-  const auto duration_us = static_cast<Metavision::timestamp>(
-    std::max(1.0, std::round(1000000.0 / event_image_fps_)));
+  const auto window_us = static_cast<Metavision::timestamp>(
+    std::max(1.0, std::round(event_image_window_ms_ * 1000.0)));
+  const auto stride_us = static_cast<Metavision::timestamp>(
+    std::max(1.0, std::round(event_image_stride_ms_ * 1000.0)));
   if (gep_positive_counts_.empty()) {
     const auto pixels = static_cast<std::size_t>(event_image_width_) * event_image_height_;
     gep_positive_counts_.assign(pixels, 0U);
@@ -426,16 +458,22 @@ void PreprocessorComponent::process_gep_events(
   }
 
   for (const auto & event : events) {
-    if (gep_window_end_us_ == 0 || event.t < gep_window_start_us_) {
+    if (gep_last_event_us_ != 0 && event.t < gep_last_event_us_) {
       std::fill(gep_positive_counts_.begin(), gep_positive_counts_.end(), 0U);
       std::fill(gep_negative_counts_.begin(), gep_negative_counts_.end(), 0U);
-      gep_window_start_us_ = event.t;
-      gep_window_end_us_ = event.t + duration_us;
+      gep_events_.clear();
+      gep_next_publish_us_ = 0;
     }
-    while (event.t > gep_window_end_us_) {
-      publish_gep_frame(gep_window_end_us_);
-      gep_window_start_us_ = gep_window_end_us_;
-      gep_window_end_us_ += duration_us;
+    gep_last_event_us_ = event.t;
+    if (gep_next_publish_us_ == 0) {
+      // Wait for one complete window before the first image. Later images use
+      // the configured (possibly overlapping) stride.
+      gep_next_publish_us_ = event.t + window_us;
+    }
+    while (event.t > gep_next_publish_us_) {
+      evict_gep_events(gep_next_publish_us_ - window_us);
+      publish_gep_frame(gep_next_publish_us_);
+      gep_next_publish_us_ += stride_us;
     }
     if (event.x >= event_image_width_ || event.y >= event_image_height_) {
       continue;
@@ -446,6 +484,7 @@ void PreprocessorComponent::process_gep_events(
     if (count < std::numeric_limits<std::uint32_t>::max()) {
       ++count;
     }
+    gep_events_.push_back(event);
   }
   const auto preprocess_ns = static_cast<std::uint64_t>(
     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -453,6 +492,21 @@ void PreprocessorComponent::process_gep_events(
   gep_preprocess_calls_.fetch_add(1, std::memory_order_relaxed);
   gep_preprocess_time_ns_.fetch_add(preprocess_ns, std::memory_order_relaxed);
   update_max(gep_preprocess_time_max_ns_, preprocess_ns);
+}
+
+void PreprocessorComponent::evict_gep_events(
+  const Metavision::timestamp window_start_us)
+{
+  while (!gep_events_.empty() && gep_events_.front().t <= window_start_us) {
+    const auto & event = gep_events_.front();
+    const auto index =
+      static_cast<std::size_t>(event.y) * event_image_width_ + event.x;
+    auto & count = event.p ? gep_positive_counts_[index] : gep_negative_counts_[index];
+    if (count > 0U) {
+      --count;
+    }
+    gep_events_.pop_front();
+  }
 }
 
 void PreprocessorComponent::publish_gep_frame(
@@ -505,8 +559,6 @@ void PreprocessorComponent::publish_gep_frame(
   gep_render_calls_.fetch_add(1, std::memory_order_relaxed);
   gep_render_time_ns_.fetch_add(render_ns, std::memory_order_relaxed);
   update_max(gep_render_time_max_ns_, render_ns);
-  std::fill(gep_positive_counts_.begin(), gep_positive_counts_.end(), 0U);
-  std::fill(gep_negative_counts_.begin(), gep_negative_counts_.end(), 0U);
 }
 
 void PreprocessorComponent::on_frame_generated(Metavision::timestamp ts_us, cv::Mat & frame)
@@ -559,16 +611,17 @@ void PreprocessorComponent::start_or_update_frame_generator()
     return;
   }
 
-  const std::uint32_t acc_us = (event_image_fps_ > 0.0) ?
-    static_cast<std::uint32_t>(1000000.0 / event_image_fps_) : 40000U;
+  const std::uint32_t acc_us = static_cast<std::uint32_t>(
+    std::max(1.0, std::round(event_image_window_ms_ * 1000.0)));
 
   if (event_image_style_ == "gep") {
     frame_generation_algo_.reset();
     const auto pixels = static_cast<std::size_t>(event_image_width_) * event_image_height_;
     gep_positive_counts_.assign(pixels, 0U);
     gep_negative_counts_.assign(pixels, 0U);
-    gep_window_start_us_ = 0;
-    gep_window_end_us_ = 0;
+    gep_events_.clear();
+    gep_next_publish_us_ = 0;
+    gep_last_event_us_ = 0;
     return;
   }
 
@@ -593,12 +646,65 @@ void PreprocessorComponent::reset_event_image_decoder()
   cd_buffer_.clear();
   gep_positive_counts_.clear();
   gep_negative_counts_.clear();
-  gep_window_start_us_ = 0;
-  gep_window_end_us_ = 0;
+  gep_events_.clear();
+  gep_next_publish_us_ = 0;
+  gep_last_event_us_ = 0;
   event_decoder_factory_ = std::make_unique<EventDecoderFactory>();
   decoded_events_in_packet_ = 0;
   out_of_bounds_events_in_packet_ = 0;
   events_in_active_image_ = 0;
+}
+
+rcl_interfaces::msg::SetParametersResult PreprocessorComponent::on_parameters(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+  double window_ms = event_image_window_ms_;
+  double stride_ms = event_image_stride_ms_;
+  bool changed = false;
+  try {
+    for (const auto & parameter : parameters) {
+      if (parameter.get_name() == "event_image_window_ms") {
+        window_ms = parameter.as_double();
+        changed = true;
+      } else if (parameter.get_name() == "event_image_stride_ms") {
+        stride_ms = parameter.as_double();
+        changed = true;
+      } else if (parameter.get_name() == "event_image_fps") {
+        throw std::invalid_argument(
+          "event_image_fps is a startup compatibility option; change event_image_stride_ms");
+      }
+    }
+    if (!changed) {
+      return result;
+    }
+    if (
+      !std::isfinite(window_ms) || window_ms <= 0.0 ||
+      !std::isfinite(stride_ms) || stride_ms <= 0.0)
+    {
+      throw std::invalid_argument("event image window and stride must be finite and positive");
+    }
+    if (stride_ms > window_ms) {
+      throw std::invalid_argument("event_image_stride_ms must not exceed event_image_window_ms");
+    }
+
+    const std::scoped_lock image_lock(event_image_mutex_);
+    event_image_window_ms_ = window_ms;
+    event_image_stride_ms_ = stride_ms;
+    event_image_fps_ = 1000.0 / stride_ms;
+    reset_event_image_decoder();
+    if (event_image_subscriber_active_) {
+      start_or_update_frame_generator();
+    }
+    RCLCPP_INFO(
+      get_logger(), "Event image timing updated: window=%.3fms stride=%.3fms fps=%.3f",
+      event_image_window_ms_, event_image_stride_ms_, event_image_fps_);
+  } catch (const std::exception & error) {
+    result.successful = false;
+    result.reason = error.what();
+  }
+  return result;
 }
 
 bool PreprocessorComponent::has_output_subscribers() const
@@ -635,6 +741,15 @@ void PreprocessorComponent::print_statistics()
   last_statistics_time_ = statistics_time;
   if (elapsed_s <= 0.0) {
     return;
+  }
+  double event_image_window_ms;
+  double event_image_stride_ms;
+  double event_image_target_hz;
+  {
+    const std::scoped_lock image_lock(event_image_mutex_);
+    event_image_window_ms = event_image_window_ms_;
+    event_image_stride_ms = event_image_stride_ms_;
+    event_image_target_hz = event_image_fps_;
   }
 
   const auto received_messages =
@@ -784,6 +899,9 @@ void PreprocessorComponent::print_statistics()
       make_key_value("image_hz", image_hz),
       make_key_value("image_mib_s", image_mib_s),
       make_key_value("events_per_image", events_per_image),
+      make_key_value("event_image_window_ms", event_image_window_ms),
+      make_key_value("event_image_stride_ms", event_image_stride_ms),
+      make_key_value("event_image_target_hz", event_image_target_hz),
       make_key_value("image_timer_mean_us", image_timer_mean_us),
       make_key_value("image_timer_max_us", image_timer_max_ns / ns_per_us),
       make_key_value("event_image_style", event_image_style_),
@@ -818,7 +936,8 @@ void PreprocessorComponent::print_statistics()
       "transport_mean_us=%.2f transport_max_us=%.2f "
       "decoded_mev_s=%.3f decode_mean_us=%.2f decode_max_us=%.2f "
       "decode_ns_per_event=%.2f image_hz=%.1f image_mib_s=%.3f "
-      "events_per_image=%.1f image_timer_mean_us=%.2f "
+      "events_per_image=%.1f window_ms=%.3f stride_ms=%.3f target_hz=%.1f "
+      "image_timer_mean_us=%.2f "
       "image_timer_max_us=%.2f gep_preprocess_mean_us=%.2f "
       "gep_preprocess_max_us=%.2f gep_preprocess_busy_pct=%.2f "
       "gep_render_mean_us=%.2f gep_render_max_us=%.2f "
@@ -830,7 +949,8 @@ void PreprocessorComponent::print_statistics()
       callback_busy_pct, callback_ns_per_kib, latency_mean_us,
       latency_max_ns / ns_per_us, decoded_mev_s, decode_mean_us,
       decode_max_ns / ns_per_us, decode_ns_per_event, image_hz,
-      image_mib_s, events_per_image, image_timer_mean_us,
+      image_mib_s, events_per_image, event_image_window_ms,
+      event_image_stride_ms, event_image_target_hz, image_timer_mean_us,
       image_timer_max_ns / ns_per_us,
       gep_preprocess_mean_us, gep_preprocess_max_ns / ns_per_us,
       gep_preprocess_busy_pct, gep_render_mean_us, gep_render_max_ns / ns_per_us,
