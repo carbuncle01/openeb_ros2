@@ -108,6 +108,19 @@ private:
 
   std::atomic<std::uint64_t> received_messages_{0};
   std::atomic<std::uint64_t> received_bytes_{0};
+  std::atomic<std::uint64_t> received_messages_total_{0};
+  std::atomic<std::uint64_t> published_messages_total_{0};
+  std::atomic<bool> received_sequence_initialized_{false};
+  std::atomic<std::uint64_t> last_received_sequence_{0};
+  std::atomic<std::uint64_t> last_published_sequence_{0};
+  std::atomic<std::uint64_t> input_sequence_gap_packets_{0};
+  std::atomic<std::uint64_t> input_sequence_gap_events_{0};
+  std::atomic<std::uint64_t> input_sequence_gap_max_{0};
+  std::atomic<std::uint64_t> input_sequence_reorders_{0};
+  std::atomic<std::int64_t> last_receive_steady_ns_{0};
+  std::atomic<std::uint64_t> receive_interarrival_ns_{0};
+  std::atomic<std::uint64_t> receive_interarrival_max_ns_{0};
+  std::atomic<std::uint64_t> receive_interarrival_samples_{0};
   std::atomic<std::uint64_t> published_messages_{0};
   std::atomic<std::uint64_t> published_bytes_{0};
   std::atomic<std::uint64_t> dropped_empty_{0};

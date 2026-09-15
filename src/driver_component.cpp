@@ -173,6 +173,8 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   raw_recording_split_duration_s_ =
     declare_parameter<double>("raw_recording_split_duration_s", 0.0);
   packet_duration_us_ = declare_parameter<std::int64_t>("packet_duration_us", 1000);
+  publish_gap_warning_us_ =
+    declare_parameter<std::int64_t>("publish_gap_warning_us", 4000);
 
   const auto packet_size =
     declare_parameter<std::int64_t>("packet_size_bytes", 1000000);
@@ -185,8 +187,9 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   if (encoding_ != "evt3") {
     throw std::invalid_argument("Only the evt3 encoding is currently supported");
   }
-  if (packet_duration_us_ < 0) {
-    throw std::invalid_argument("packet_duration_us must be non-negative");
+  if (packet_duration_us_ < 0 || publish_gap_warning_us_ <= 0) {
+    throw std::invalid_argument(
+      "packet_duration_us must be non-negative and publish_gap_warning_us must be positive");
   }
   if (packet_size <= 0) {
     throw std::invalid_argument("packet_size_bytes must be positive");
@@ -664,9 +667,25 @@ void DriverComponent::publish_pending_packet(
   }
 
   const auto packet_bytes = pending_packet_->events.size();
+  const auto packet_sequence = pending_packet_->seq;
+  if (has_published_ && publish_time > last_publish_time_) {
+    const auto interval_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        publish_time - last_publish_time_).count());
+    publish_interval_time_ns_.fetch_add(interval_ns, std::memory_order_relaxed);
+    publish_interval_samples_.fetch_add(1, std::memory_order_relaxed);
+    update_max(publish_interval_time_max_ns_, interval_ns);
+    if (
+      interval_ns > static_cast<std::uint64_t>(publish_gap_warning_us_) * 1000ULL)
+    {
+      publish_interval_over_gap_threshold_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   reserve_size_ = std::max(reserve_size_, packet_bytes);
   published_messages_.fetch_add(1, std::memory_order_relaxed);
   published_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
+  published_messages_total_.fetch_add(1, std::memory_order_relaxed);
+  last_published_sequence_.store(packet_sequence, std::memory_order_relaxed);
   event_publisher_->publish(std::move(pending_packet_));
   pending_bytes_.store(0, std::memory_order_relaxed);
   last_publish_time_ = publish_time;
@@ -736,6 +755,14 @@ void DriverComponent::print_statistics()
     interarrival_time_max_ns_.exchange(0, std::memory_order_relaxed);
   const auto interarrival_samples =
     interarrival_samples_.exchange(0, std::memory_order_relaxed);
+  const auto publish_interval_ns =
+    publish_interval_time_ns_.exchange(0, std::memory_order_relaxed);
+  const auto publish_interval_max_ns =
+    publish_interval_time_max_ns_.exchange(0, std::memory_order_relaxed);
+  const auto publish_interval_samples =
+    publish_interval_samples_.exchange(0, std::memory_order_relaxed);
+  const auto publish_interval_over_gap_threshold =
+    publish_interval_over_gap_threshold_.exchange(0, std::memory_order_relaxed);
 
   constexpr double bytes_per_mib = 1024.0 * 1024.0;
   constexpr double bytes_per_kib = 1024.0;
@@ -760,6 +787,9 @@ void DriverComponent::print_statistics()
   const double interarrival_mean_us =
     interarrival_samples == 0 ? 0.0 :
     static_cast<double>(interarrival_ns) / interarrival_samples / ns_per_us;
+  const double publish_interval_mean_us =
+    publish_interval_samples == 0 ? 0.0 :
+    static_cast<double>(publish_interval_ns) / publish_interval_samples / ns_per_us;
 
   bool raw_recording_active = false;
   std::string raw_recording_path;
@@ -789,6 +819,20 @@ void DriverComponent::print_statistics()
       make_key_value("avg_raw_kib", average_raw_kib),
       make_key_value("publish_hz", publish_hz),
       make_key_value("publish_mib_s", publish_mib_s),
+      make_key_value(
+        "published_messages_total",
+        published_messages_total_.load(std::memory_order_relaxed)),
+      make_key_value(
+        "last_published_sequence",
+        last_published_sequence_.load(std::memory_order_relaxed)),
+      make_key_value("publish_interval_mean_us", publish_interval_mean_us),
+      make_key_value("publish_interval_max_us", publish_interval_max_ns / ns_per_us),
+      make_key_value(
+        "publish_interval_over_gap_threshold", publish_interval_over_gap_threshold),
+      make_key_value(
+        "publish_gap_warning_us", static_cast<double>(publish_gap_warning_us_)),
+      make_key_value(
+        "packet_duration_threshold_us", static_cast<double>(packet_duration_us_)),
       make_key_value("callback_mean_us", callback_mean_us),
       make_key_value("callback_max_us", callback_max_ns / ns_per_us),
       make_key_value("callback_busy_pct", callback_busy_pct),
@@ -819,12 +863,20 @@ void DriverComponent::print_statistics()
       "publish_hz=%.1f publish_mib_s=%.3f callback_mean_us=%.2f "
       "callback_max_us=%.2f callback_busy_pct=%.2f "
       "callback_ns_per_kib=%.2f interarrival_mean_us=%.2f "
-      "interarrival_max_us=%.2f no_subscriber=%llu pending_bytes=%llu "
+      "interarrival_max_us=%.2f publish_interval_mean_us=%.2f "
+      "publish_interval_max_us=%.2f publish_interval_over_gap_threshold=%llu "
+      "published_total=%llu last_seq=%llu no_subscriber=%llu pending_bytes=%llu "
       "raw_recording_active=%s raw_recording_path=%s",
       raw_hz, raw_mib_s, average_raw_kib, publish_hz, publish_mib_s,
       callback_mean_us, callback_max_ns / ns_per_us,
       callback_busy_pct, callback_ns_per_kib, interarrival_mean_us,
       interarrival_max_ns / ns_per_us,
+      publish_interval_mean_us, publish_interval_max_ns / ns_per_us,
+      static_cast<unsigned long long>(publish_interval_over_gap_threshold),
+      static_cast<unsigned long long>(
+        published_messages_total_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+        last_published_sequence_.load(std::memory_order_relaxed)),
       static_cast<unsigned long long>(no_subscriber),
       static_cast<unsigned long long>(
         pending_bytes_.load(std::memory_order_relaxed)),

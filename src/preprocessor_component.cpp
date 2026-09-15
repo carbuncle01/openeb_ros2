@@ -211,8 +211,36 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
 
   const auto callback_start = std::chrono::steady_clock::now();
   const auto packet_bytes = packet->events.size();
+  const auto packet_sequence = static_cast<std::uint64_t>(packet->seq);
   received_messages_.fetch_add(1, std::memory_order_relaxed);
   received_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
+  received_messages_total_.fetch_add(1, std::memory_order_relaxed);
+
+  const auto arrival_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    callback_start.time_since_epoch()).count();
+  const auto previous_arrival_ns =
+    last_receive_steady_ns_.exchange(arrival_ns, std::memory_order_relaxed);
+  if (previous_arrival_ns > 0 && arrival_ns > previous_arrival_ns) {
+    const auto interval_ns = static_cast<std::uint64_t>(arrival_ns - previous_arrival_ns);
+    receive_interarrival_ns_.fetch_add(interval_ns, std::memory_order_relaxed);
+    receive_interarrival_samples_.fetch_add(1, std::memory_order_relaxed);
+    update_max(receive_interarrival_max_ns_, interval_ns);
+  }
+
+  const bool had_previous_sequence =
+    received_sequence_initialized_.exchange(true, std::memory_order_relaxed);
+  const auto previous_sequence =
+    last_received_sequence_.exchange(packet_sequence, std::memory_order_relaxed);
+  if (had_previous_sequence) {
+    if (packet_sequence > previous_sequence + 1U) {
+      const auto missing = packet_sequence - previous_sequence - 1U;
+      input_sequence_gap_packets_.fetch_add(1, std::memory_order_relaxed);
+      input_sequence_gap_events_.fetch_add(missing, std::memory_order_relaxed);
+      update_max(input_sequence_gap_max_, missing);
+    } else if (packet_sequence <= previous_sequence) {
+      input_sequence_reorders_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
 
   const auto receive_time = now();
   const rclcpp::Time source_time(
@@ -284,6 +312,8 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
 
   published_messages_.fetch_add(1, std::memory_order_relaxed);
   published_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
+  published_messages_total_.fetch_add(1, std::memory_order_relaxed);
+  last_published_sequence_.store(packet_sequence, std::memory_order_relaxed);
   event_publisher_->publish(std::move(packet));
   record_callback_time(callback_start);
 }
@@ -756,6 +786,20 @@ void PreprocessorComponent::print_statistics()
     received_messages_.exchange(0, std::memory_order_relaxed);
   const auto received_bytes =
     received_bytes_.exchange(0, std::memory_order_relaxed);
+  const auto receive_interarrival_ns =
+    receive_interarrival_ns_.exchange(0, std::memory_order_relaxed);
+  const auto receive_interarrival_max_ns =
+    receive_interarrival_max_ns_.exchange(0, std::memory_order_relaxed);
+  const auto receive_interarrival_samples =
+    receive_interarrival_samples_.exchange(0, std::memory_order_relaxed);
+  const auto input_sequence_gap_packets =
+    input_sequence_gap_packets_.exchange(0, std::memory_order_relaxed);
+  const auto input_sequence_gap_events =
+    input_sequence_gap_events_.exchange(0, std::memory_order_relaxed);
+  const auto input_sequence_gap_max =
+    input_sequence_gap_max_.exchange(0, std::memory_order_relaxed);
+  const auto input_sequence_reorders =
+    input_sequence_reorders_.exchange(0, std::memory_order_relaxed);
   const auto published_messages =
     published_messages_.exchange(0, std::memory_order_relaxed);
   const auto published_bytes =
@@ -838,6 +882,10 @@ void PreprocessorComponent::print_statistics()
   const double latency_mean_us =
     latency_samples == 0 ? 0.0 :
     static_cast<double>(latency_ns) / latency_samples / ns_per_us;
+  const double receive_interarrival_mean_us =
+    receive_interarrival_samples == 0 ? 0.0 :
+    static_cast<double>(receive_interarrival_ns) /
+    receive_interarrival_samples / ns_per_us;
   const double decoded_mev_s =
     static_cast<double>(decoded_events) / 1.0e6 / elapsed_s;
   const double decode_mean_us =
@@ -872,7 +920,8 @@ void PreprocessorComponent::print_statistics()
 
     diagnostic_msgs::msg::DiagnosticStatus status;
     const bool has_warning =
-      dropped_encoding > 0 || decode_errors > 0 || out_of_bounds_events > 0;
+      dropped_encoding > 0 || decode_errors > 0 || out_of_bounds_events > 0 ||
+      input_sequence_gap_events > 0 || input_sequence_reorders > 0;
     status.level = has_warning ?
       diagnostic_msgs::msg::DiagnosticStatus::WARN :
       diagnostic_msgs::msg::DiagnosticStatus::OK;
@@ -883,6 +932,24 @@ void PreprocessorComponent::print_statistics()
     status.values = {
       make_key_value("receive_hz", receive_hz),
       make_key_value("receive_mib_s", receive_mib_s),
+      make_key_value(
+        "received_messages_total",
+        received_messages_total_.load(std::memory_order_relaxed)),
+      make_key_value(
+        "published_messages_total",
+        published_messages_total_.load(std::memory_order_relaxed)),
+      make_key_value(
+        "last_received_sequence",
+        last_received_sequence_.load(std::memory_order_relaxed)),
+      make_key_value(
+        "last_published_sequence",
+        last_published_sequence_.load(std::memory_order_relaxed)),
+      make_key_value("input_sequence_gap_occurrences", input_sequence_gap_packets),
+      make_key_value("input_sequence_missing_packets", input_sequence_gap_events),
+      make_key_value("input_sequence_gap_max", input_sequence_gap_max),
+      make_key_value("input_sequence_reorders", input_sequence_reorders),
+      make_key_value("receive_interarrival_mean_us", receive_interarrival_mean_us),
+      make_key_value("receive_interarrival_max_us", receive_interarrival_max_ns / ns_per_us),
       make_key_value("avg_packet_kib", average_packet_kib),
       make_key_value("publish_hz", publish_hz),
       make_key_value("publish_mib_s", publish_mib_s),
@@ -931,6 +998,8 @@ void PreprocessorComponent::print_statistics()
       get_logger(),
       "preprocessor_stats receive_hz=%.1f receive_mib_s=%.3f "
       "avg_packet_kib=%.2f publish_hz=%.1f publish_mib_s=%.3f "
+      "receive_interval_mean/max=%.2f/%.2fus seq_missing=%llu "
+      "seq_gap_max=%llu seq_reorders=%llu received_total=%llu published_total=%llu "
       "callback_mean_us=%.2f callback_max_us=%.2f callback_busy_pct=%.2f "
       "callback_ns_per_kib=%.2f "
       "transport_mean_us=%.2f transport_max_us=%.2f "
@@ -945,7 +1014,16 @@ void PreprocessorComponent::print_statistics()
       "no_subscriber=%llu image_no_subscriber=%llu decode_errors=%llu "
       "out_of_bounds_events=%llu",
       receive_hz, receive_mib_s, average_packet_kib, publish_hz,
-      publish_mib_s, callback_mean_us, callback_max_ns / ns_per_us,
+      publish_mib_s, receive_interarrival_mean_us,
+      receive_interarrival_max_ns / ns_per_us,
+      static_cast<unsigned long long>(input_sequence_gap_events),
+      static_cast<unsigned long long>(input_sequence_gap_max),
+      static_cast<unsigned long long>(input_sequence_reorders),
+      static_cast<unsigned long long>(
+        received_messages_total_.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+        published_messages_total_.load(std::memory_order_relaxed)),
+      callback_mean_us, callback_max_ns / ns_per_us,
       callback_busy_pct, callback_ns_per_kib, latency_mean_us,
       latency_max_ns / ns_per_us, decoded_mev_s, decode_mean_us,
       decode_max_ns / ns_per_us, decode_ns_per_event, image_hz,

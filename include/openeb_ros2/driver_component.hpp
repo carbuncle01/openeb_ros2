@@ -85,6 +85,7 @@ private:
   std::string raw_recording_dir_;
   std::string raw_recording_basename_;
   std::int64_t packet_duration_us_{1000};
+  std::int64_t publish_gap_warning_us_{4000};
   std::size_t packet_size_bytes_{1000000};
   std::size_t reserve_size_{0};
   std::uint64_t sequence_{0};
@@ -110,6 +111,12 @@ private:
   std::atomic<std::uint64_t> raw_bytes_{0};
   std::atomic<std::uint64_t> published_messages_{0};
   std::atomic<std::uint64_t> published_bytes_{0};
+  std::atomic<std::uint64_t> published_messages_total_{0};
+  std::atomic<std::uint64_t> last_published_sequence_{0};
+  std::atomic<std::uint64_t> publish_interval_time_ns_{0};
+  std::atomic<std::uint64_t> publish_interval_time_max_ns_{0};
+  std::atomic<std::uint64_t> publish_interval_samples_{0};
+  std::atomic<std::uint64_t> publish_interval_over_gap_threshold_{0};
   std::atomic<std::uint64_t> no_subscriber_callbacks_{0};
   std::atomic<std::uint64_t> callback_time_ns_{0};
   std::atomic<std::uint64_t> callback_time_max_ns_{0};
