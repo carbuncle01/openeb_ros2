@@ -4,24 +4,32 @@
   <name>openeb_ros2</name>
   <version>0.1.0</version>
   <description>
-    ROS 2 Jazzy driver and preprocessing components for OpenEB event cameras.
+    ROS 2 Lyrical driver and preprocessing components for OpenEB event cameras.
   </description>
 
   <maintainer email="maintainer@example.com">OpenEB ROS 2 Maintainer</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
   <depend>event_camera_codecs</depend>
   <depend>event_camera_msgs</depend>
-  <depend>jetpilot_msgs</depend>
+  <depend>isaac_ros_common</depend>
+  <depend>isaac_ros_tensor_msgs</depend>
+  <depend>tensor_msgs</depend>
+  <depend>cuda_buffer</depend>
+  <depend>std_msgs</depend>
   <depend>diagnostic_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
+  <depend>builtin_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
 
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>cuda_buffer_backend</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ros2launch</exec_depend>

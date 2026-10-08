@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -31,6 +33,9 @@ class PreprocessorComponent
 {
 public:
   explicit PreprocessorComponent(const rclcpp::NodeOptions & options);
+  ~PreprocessorComponent() override;
+  // Optional visualization input: never publishes an EventPacket in direct mode.
+  void enqueue_image(const event_camera_msgs::msg::EventPacket & packet);
 
   void eventCD(
     std::uint64_t sensor_time, std::uint16_t x, std::uint16_t y,
@@ -48,6 +53,10 @@ private:
     event_camera_codecs::DecoderFactory<EventPacket, PreprocessorComponent>;
 
   void on_packet(EventPacket::UniquePtr packet);
+  void image_worker_loop();
+  void publish_direct_image_timer();
+  void update_image_timer();
+  builtin_interfaces::msg::Time image_stamp(Metavision::timestamp timestamp_us) const;
   bool preprocess(EventPacket & packet);
   void decode_for_event_image(const EventPacket & packet);
   void process_gep_events(const std::vector<Metavision::EventCD> & events);
@@ -64,6 +73,25 @@ private:
   rcl_interfaces::msg::SetParametersResult on_parameters(
     const std::vector<rclcpp::Parameter> & parameters);
 
+  struct ImageWork {
+    EventPacket::UniquePtr packet;
+    std::chrono::steady_clock::time_point enqueued;
+  };
+  std::mutex direct_queue_mutex_;
+  std::condition_variable direct_queue_cv_;
+  std::deque<ImageWork> direct_queue_;
+  std::thread direct_image_worker_;
+  bool direct_queue_stop_{false};
+  std::size_t direct_queue_capacity_{4};
+  std::size_t direct_queue_max_bytes_{8388608};
+  std::size_t direct_queue_bytes_{0};
+  double direct_queue_max_age_ms_{100.0};
+  std::atomic<bool> direct_image_gap_{false};
+  std::atomic<std::uint64_t> direct_image_drops_{0};
+  bool packet_forward_enabled_{true};
+  std::int64_t image_timestamp_offset_ns_{0};
+  bool image_timestamp_initialized_{false};
+  rclcpp::TimerBase::SharedPtr image_timer_;
   rclcpp::Subscription<EventPacket>::SharedPtr event_subscription_;
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr event_image_publisher_;

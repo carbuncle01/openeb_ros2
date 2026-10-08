@@ -1,17 +1,18 @@
 /event_camera/event_camera_driver:
   ros__parameters:
+    packet_publish_enabled: true
     serial: ""
     device_format: ""
-    bias_file: ""  # Metavision .bias file; empty preserves camera defaults
+    bias_file: ""
     encoding: "evt3"
     frame_id: "event_camera"
     raw_recording_enabled: false
-    raw_recording_request_topic: "raw_recording/request"
     raw_recording_auto_start: true
     raw_recording_dir: ""
-    raw_recording_basename: "openeb"
+    raw_recording_basename: ""
     raw_recording_split_duration_s: 0.0
     packet_duration_us: 1000
+    publish_gap_warning_us: 4000
     packet_size_bytes: 1000000
     publisher_depth: 8
     statistics_interval_s: 1.0
@@ -19,21 +20,25 @@
 
 /event_camera/event_preprocessor:
   ros__parameters:
+    packet_forward_enabled: true
+    subscribe_packets: true
+    image_queue_capacity: 4
+    image_queue_max_bytes: 8388608
+    image_queue_max_age_ms: 100.0
     expected_encoding: "evt3"
     output_frame_id: ""
     drop_empty_packets: true
     drop_unexpected_encoding: true
-    subscription_depth: 8
-    publisher_depth: 8
     event_image_enabled: true
     event_image_fps: 25.0
-    # Zero keeps the legacy behavior: both values become 1000 / event_image_fps.
     event_image_window_ms: 0.0
     event_image_stride_ms: 0.0
     event_image_encoding: "bgr8"
     event_image_style: "dark"
     event_image_percentile: 90.0
     event_image_publish_empty: true
+    debug: false
+    subscription_depth: 8
+    publisher_depth: 8
     event_image_publisher_depth: 2
     statistics_interval_s: 1.0
-    debug: false

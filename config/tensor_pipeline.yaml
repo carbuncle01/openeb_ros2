@@ -1,0 +1,3 @@
+/**/tensor_pipeline:
+  ros__parameters:
+    tensor_backend: "cuda_async"

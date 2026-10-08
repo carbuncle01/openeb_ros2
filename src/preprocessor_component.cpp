@@ -1,4 +1,5 @@
 #include "openeb_ros2/preprocessor_component.hpp"
+#include "openeb_ros2/event_palette.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +66,17 @@ diagnostic_msgs::msg::KeyValue make_key_value(
 PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options)
 : Node("openeb_preprocessor", options)
 {
+  packet_forward_enabled_ = declare_parameter<bool>("packet_forward_enabled", true);
+  const auto subscribe_packets = declare_parameter<bool>("subscribe_packets", true);
+  const auto image_queue_capacity = declare_parameter<std::int64_t>("image_queue_capacity", 4);
+  const auto image_queue_max_bytes = declare_parameter<std::int64_t>("image_queue_max_bytes", 8388608);
+  direct_queue_max_age_ms_ = declare_parameter<double>("image_queue_max_age_ms", 100.0);
+  if (image_queue_capacity <= 0 || image_queue_max_bytes <= 0 ||
+      !std::isfinite(direct_queue_max_age_ms_) || direct_queue_max_age_ms_ <= 0.0) {
+    throw std::invalid_argument("image queue bounds must be finite and positive");
+  }
+  direct_queue_capacity_ = static_cast<std::size_t>(image_queue_capacity);
+  direct_queue_max_bytes_ = static_cast<std::size_t>(image_queue_max_bytes);
   expected_encoding_ =
     declare_parameter<std::string>("expected_encoding", "evt3");
   output_frame_id_ =
@@ -139,11 +151,11 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     throw std::invalid_argument(
       "event_image_encoding must be either 'bgr8' or 'mono8'");
   }
-  if (event_image_style_ != "dark" && event_image_style_ != "gep") {
-    throw std::invalid_argument("event_image_style must be either 'dark' or 'gep'");
+  if (event_image_style_ != "dark" && event_image_style_ != "gep" && event_image_style_ != "red_blue_white") {
+    throw std::invalid_argument("event_image_style must be dark, gep, or red_blue_white");
   }
-  if (event_image_style_ == "gep" && event_image_encoding_ != "bgr8") {
-    throw std::invalid_argument("event_image_style='gep' requires event_image_encoding='bgr8'");
+  if (event_image_style_ != "dark" && event_image_encoding_ != "bgr8") {
+    throw std::invalid_argument("white-background event image requires event_image_encoding='bgr8'");
   }
   if (
     !std::isfinite(event_image_percentile_) ||
@@ -175,9 +187,11 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
                                  .durability_volatile();
   diagnostics_publisher_ =
     create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
+  if (subscribe_packets) {
   event_subscription_ = create_subscription<EventPacket>(
     "events_raw", subscription_qos,
     std::bind(&PreprocessorComponent::on_packet, this, std::placeholders::_1));
+  }
 
   if (event_image_enabled_) {
     event_image_publisher_ =
@@ -201,6 +215,108 @@ PreprocessorComponent::PreprocessorComponent(const rclcpp::NodeOptions & options
     statistics_timer_ = create_wall_timer(
       period_ms, std::bind(&PreprocessorComponent::print_statistics, this));
   }
+  update_image_timer();
+  if (!subscribe_packets) {
+    direct_image_worker_ = std::thread(&PreprocessorComponent::image_worker_loop, this);
+  }
+}
+
+PreprocessorComponent::~PreprocessorComponent()
+{
+  {
+    std::lock_guard<std::mutex> lock(direct_queue_mutex_);
+    direct_queue_stop_ = true;
+    direct_queue_.clear();
+  }
+  direct_queue_cv_.notify_all();
+  if (direct_image_worker_.joinable()) { direct_image_worker_.join(); }
+}
+
+void PreprocessorComponent::enqueue_image(const EventPacket & packet)
+{
+  if (!event_image_enabled_) { return; }
+  if (!has_event_image_subscribers()) { direct_image_gap_.store(true); return; }
+  std::lock_guard<std::mutex> lock(direct_queue_mutex_);
+  if (direct_queue_stop_) { return; }
+  const auto bytes = packet.events.size();
+  if (bytes > direct_queue_max_bytes_) {
+    direct_image_drops_.fetch_add(1);
+    direct_image_gap_.store(true);
+    return;
+  }
+  while (!direct_queue_.empty() && (direct_queue_.size() >= direct_queue_capacity_ ||
+         direct_queue_bytes_ + bytes > direct_queue_max_bytes_)) {
+    direct_queue_bytes_ -= direct_queue_.front().packet->events.size();
+    direct_queue_.pop_front();
+    direct_image_drops_.fetch_add(1);
+    direct_image_gap_.store(true);
+  }
+  direct_queue_.push_back({std::make_unique<EventPacket>(packet), std::chrono::steady_clock::now()});
+  direct_queue_bytes_ += bytes;
+  direct_queue_cv_.notify_one();
+}
+
+void PreprocessorComponent::image_worker_loop()
+{
+  for (;;) {
+    ImageWork work;
+    {
+      std::unique_lock<std::mutex> lock(direct_queue_mutex_);
+      direct_queue_cv_.wait(lock, [this] {return direct_queue_stop_ || !direct_queue_.empty();});
+      if (direct_queue_stop_) { return; }
+      work = std::move(direct_queue_.front());
+      direct_queue_.pop_front();
+      direct_queue_bytes_ -= work.packet->events.size();
+    }
+    const auto age_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - work.enqueued).count();
+    if (age_ms > direct_queue_max_age_ms_) {
+      direct_image_drops_.fetch_add(1);
+      direct_image_gap_.store(true);
+      continue;
+    }
+    try {
+      if (direct_image_gap_.exchange(false)) {
+        const std::scoped_lock lock(event_image_mutex_);
+        reset_event_image_decoder();
+        if (event_image_subscriber_active_) { start_or_update_frame_generator(); }
+      }
+      on_packet(std::move(work.packet));
+    } catch (const std::exception & error) {
+      direct_image_gap_.store(true);
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "Direct image worker: %s", error.what());
+    }
+  }
+}
+
+builtin_interfaces::msg::Time PreprocessorComponent::image_stamp(Metavision::timestamp timestamp_us) const
+{
+  const auto ns = image_timestamp_initialized_ ? std::max<std::int64_t>(0, timestamp_us * 1000LL + image_timestamp_offset_ns_) : now().nanoseconds();
+  builtin_interfaces::msg::Time stamp;
+  stamp.sec = static_cast<std::int32_t>(ns / 1000000000LL);
+  stamp.nanosec = static_cast<std::uint32_t>(ns % 1000000000LL);
+  return stamp;
+}
+
+void PreprocessorComponent::update_image_timer()
+{
+  image_timer_.reset();
+  if (event_image_enabled_ && event_image_style_ == "red_blue_white") {
+    image_timer_ = create_wall_timer(std::chrono::microseconds(
+      static_cast<std::int64_t>(std::max(1.0, event_image_stride_ms_ * 1000.0))),
+      std::bind(&PreprocessorComponent::publish_direct_image_timer, this));
+  }
+}
+
+void PreprocessorComponent::publish_direct_image_timer()
+{
+  const std::scoped_lock lock(event_image_mutex_);
+  if (!has_event_image_subscribers() || event_image_width_ == 0 || event_image_height_ == 0) { return; }
+  if (gep_positive_counts_.empty()) { return; }
+  const auto sensor_end_us = image_timestamp_initialized_ ?
+    std::max<std::int64_t>(0, (now().nanoseconds() - image_timestamp_offset_ns_) / 1000LL) : 0;
+  evict_gep_events(sensor_end_us - static_cast<std::int64_t>(event_image_window_ms_ * 1000.0));
+  publish_gep_frame(sensor_end_us);
 }
 
 void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
@@ -304,7 +420,7 @@ void PreprocessorComponent::on_packet(EventPacket::UniquePtr packet)
     }
   }
 
-  if (!has_output_subscribers()) {
+  if (!packet_forward_enabled_ || !has_output_subscribers()) {
     no_subscriber_messages_.fetch_add(1, std::memory_order_relaxed);
     record_callback_time(callback_start);
     return;
@@ -350,7 +466,7 @@ void PreprocessorComponent::eventCD(
   const std::uint8_t polarity)
 {
   ++decoded_events_in_packet_;
-  if (!frame_generation_algo_ && event_image_style_ != "gep") {
+  if (!frame_generation_algo_ && event_image_style_ == "dark") {
     return;
   }
   if (x >= event_image_width_ || y >= event_image_height_) {
@@ -427,7 +543,12 @@ void PreprocessorComponent::decode_for_event_image(const EventPacket & packet)
   decode_time_ns_.fetch_add(decode_ns, std::memory_order_relaxed);
   update_max(decode_time_max_ns_, decode_ns);
 
-  if (event_image_style_ == "gep") {
+  if (!cd_buffer_.empty()) {
+    // Estimate ROS epoch from packet reception; this is not hardware synchronization.
+    image_timestamp_offset_ns_ = rclcpp::Time(packet.header.stamp).nanoseconds() - cd_buffer_.back().t * 1000LL;
+    image_timestamp_initialized_ = true;
+  }
+  if (event_image_style_ != "dark") {
     process_gep_events(cd_buffer_);
   } else if (frame_generation_algo_ && !cd_buffer_.empty()) {
     frame_generation_algo_->process_events(cd_buffer_.cbegin(), cd_buffer_.cend());
@@ -500,9 +621,13 @@ void PreprocessorComponent::process_gep_events(
       // the configured (possibly overlapping) stride.
       gep_next_publish_us_ = event.t + window_us;
     }
+    if (event_image_style_ == "red_blue_white") {
+      evict_gep_events(event.t - window_us);
+      gep_next_publish_us_ = event.t + stride_us;
+    }
     while (event.t > gep_next_publish_us_) {
       evict_gep_events(gep_next_publish_us_ - window_us);
-      publish_gep_frame(gep_next_publish_us_);
+      if (event_image_style_ != "red_blue_white") { publish_gep_frame(gep_next_publish_us_); }
       gep_next_publish_us_ += stride_us;
     }
     if (event.x >= event_image_width_ || event.y >= event_image_height_) {
@@ -556,9 +681,7 @@ void PreprocessorComponent::publish_gep_frame(
   const float negative_scale =
     percentile_scale(gep_negative_counts_, event_image_percentile_);
   auto message = std::make_unique<sensor_msgs::msg::Image>();
-  message->header.stamp.sec = static_cast<std::int32_t>(timestamp_us / 1000000LL);
-  message->header.stamp.nanosec =
-    static_cast<std::uint32_t>((timestamp_us % 1000000LL) * 1000ULL);
+  message->header.stamp = image_stamp(timestamp_us);
   message->header.frame_id = event_image_frame_id_;
   message->height = event_image_height_;
   message->width = event_image_width_;
@@ -570,6 +693,11 @@ void PreprocessorComponent::publish_gep_frame(
   for (std::size_t index = 0; index < gep_positive_counts_.size(); ++index) {
     const float positive = std::min(1.0F, gep_positive_counts_[index] / positive_scale);
     const float negative = std::min(1.0F, gep_negative_counts_[index] / negative_scale);
+    if (event_image_style_ == "red_blue_white") {
+      const auto color = red_blue_white(positive, negative);
+      std::copy(color.begin(), color.end(), message->data.begin() + index * 3U);
+      continue;
+    }
     const bool positive_dominates = positive >= negative;
     const float selected_positive = positive_dominates ? positive : 0.0F;
     const float selected_negative = positive_dominates ? 0.0F : negative;
@@ -598,8 +726,7 @@ void PreprocessorComponent::on_frame_generated(Metavision::timestamp ts_us, cv::
   }
 
   auto img_msg = std::make_unique<sensor_msgs::msg::Image>();
-  img_msg->header.stamp.sec = static_cast<std::int32_t>(ts_us / 1000000LL);
-  img_msg->header.stamp.nanosec = static_cast<std::uint32_t>((ts_us % 1000000LL) * 1000ULL);
+  img_msg->header.stamp = image_stamp(ts_us);
   img_msg->header.frame_id = event_image_frame_id_;
   img_msg->height = event_image_height_;
   img_msg->width = event_image_width_;
@@ -644,7 +771,7 @@ void PreprocessorComponent::start_or_update_frame_generator()
   const std::uint32_t acc_us = static_cast<std::uint32_t>(
     std::max(1.0, std::round(event_image_window_ms_ * 1000.0)));
 
-  if (event_image_style_ == "gep") {
+  if (event_image_style_ != "dark") {
     frame_generation_algo_.reset();
     const auto pixels = static_cast<std::size_t>(event_image_width_) * event_image_height_;
     gep_positive_counts_.assign(pixels, 0U);
@@ -723,6 +850,7 @@ rcl_interfaces::msg::SetParametersResult PreprocessorComponent::on_parameters(
     event_image_window_ms_ = window_ms;
     event_image_stride_ms_ = stride_ms;
     event_image_fps_ = 1000.0 / stride_ms;
+    update_image_timer();
     reset_event_image_decoder();
     if (event_image_subscriber_active_) {
       start_or_update_frame_generator();
@@ -972,6 +1100,7 @@ void PreprocessorComponent::print_statistics()
       make_key_value("image_timer_mean_us", image_timer_mean_us),
       make_key_value("image_timer_max_us", image_timer_max_ns / ns_per_us),
       make_key_value("event_image_style", event_image_style_),
+      make_key_value("direct_image_drops", direct_image_drops_.load()),
       make_key_value("gep_preprocess_calls", gep_preprocess_calls),
       make_key_value("gep_preprocess_mean_us", gep_preprocess_mean_us),
       make_key_value("gep_preprocess_max_us", gep_preprocess_max_ns / ns_per_us),

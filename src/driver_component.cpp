@@ -1,4 +1,5 @@
 #include "openeb_ros2/driver_component.hpp"
+#include "openeb_ros2/packet_router.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -150,8 +151,23 @@ std::string yaml_quote(const std::string & value)
 }  // namespace
 
 DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
-: Node("openeb_driver", options)
+: DriverComponent(options, {}) {}
+
+DriverComponent::DriverComponent(const rclcpp::NodeOptions & options, PacketSink sink)
+: Node("openeb_driver", options), packet_sink_(std::move(sink))
 {
+  packet_publish_enabled_.store(declare_parameter<bool>("packet_publish_enabled", true));
+  packet_parameter_callback_ = add_post_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & parameters) {
+      for (const auto & parameter : parameters) {
+        if (parameter.get_name() == "packet_publish_enabled") {
+          packet_publish_enabled_.store(parameter.as_bool(), std::memory_order_release);
+        } else if (parameter.get_name() == "raw_recording_dir") {
+          std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+          raw_recording_dir_ = parameter.as_string();
+        }
+      }
+    });
   serial_ = declare_parameter<std::string>("serial", "");
   device_format_ = declare_parameter<std::string>("device_format", "");
   rcl_interfaces::msg::ParameterDescriptor bias_file_descriptor;
@@ -162,8 +178,6 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   frame_id_ = declare_parameter<std::string>("frame_id", "event_camera");
   raw_recording_enabled_ =
     declare_parameter<bool>("raw_recording_enabled", false);
-  raw_recording_request_topic_ =
-    declare_parameter<std::string>("raw_recording_request_topic", "raw_recording/request");
   raw_recording_auto_start_ =
     declare_parameter<bool>("raw_recording_auto_start", true);
   raw_recording_dir_ =
@@ -200,7 +214,7 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
   if (statistics_interval_s_ < 0.0) {
     throw std::invalid_argument("statistics_interval_s must be non-negative");
   }
-  if (raw_recording_enabled_ && raw_recording_dir_.empty()) {
+  if (raw_recording_enabled_ && raw_recording_auto_start_ && raw_recording_dir_.empty()) {
     throw std::invalid_argument(
       "raw_recording_dir must be set when raw_recording_enabled is true");
   }
@@ -221,13 +235,6 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
                                  .durability_volatile();
   diagnostics_publisher_ =
     create_publisher<DiagnosticArray>("diagnostics", diagnostics_qos);
-  if (!raw_recording_request_topic_.empty()) {
-    raw_recording_request_sub_ = create_subscription<BagRequest>(
-      raw_recording_request_topic_, 10,
-      std::bind(
-        &DriverComponent::handle_raw_recording_request, this,
-        std::placeholders::_1));
-  }
   start_raw_recording_service_ = create_service<Trigger>(
     "start_raw_recording",
     std::bind(
@@ -239,6 +246,33 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
       &DriverComponent::handle_stop_raw_recording, this,
       std::placeholders::_1, std::placeholders::_2));
 
+  configuration_guard_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & parameters) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      for (const auto & parameter : parameters) {
+        if (parameter.get_name() == "raw_recording_dir") {
+          std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+          const auto directory = parameter.as_string();
+          if (raw_recording_active_ || !std::filesystem::path(directory).is_absolute()) {
+            result.successful = false;
+            result.reason = "raw_recording_dir requires an absolute path while RAW recording is idle";
+            break;
+          }
+          continue;
+        }
+        if (parameter.get_name() != "packet_publish_enabled" &&
+            parameter.get_name() != "use_sim_time") {
+          result.successful = false;
+          result.reason = "Driver configuration is startup-only except packet_publish_enabled/raw_recording_dir";
+          break;
+        }
+      }
+      return result;
+    });
+  split_raw_recording_service_ = create_service<Trigger>(
+    "split_raw_recording", std::bind(&DriverComponent::handle_split_raw_recording,
+      this, std::placeholders::_1, std::placeholders::_2));
   open_camera();
 
   last_statistics_time_ = std::chrono::steady_clock::now();
@@ -256,7 +290,7 @@ DriverComponent::DriverComponent(const rclcpp::NodeOptions & options)
         1,
         static_cast<std::int64_t>(raw_recording_split_duration_s_ * 1000.0)));
     raw_recording_split_timer_ = create_wall_timer(
-      period_ms, std::bind(&DriverComponent::rotate_raw_recording, this));
+      period_ms, [this]() { (void)rotate_raw_recording(); });
   }
 }
 
@@ -380,8 +414,13 @@ void DriverComponent::start_raw_recording()
       "OpenEB raw recording did not start: " +
       current_raw_recording_path_.string());
   }
-  write_raw_recording_metadata(
-    current_raw_recording_path_, system_start_time, ros_start_time);
+  try {
+    write_raw_recording_metadata(current_raw_recording_path_, system_start_time, ros_start_time);
+  } catch (...) {
+    camera_.stop_recording(current_raw_recording_path_);
+    current_raw_recording_path_.clear();
+    throw;
+  }
   raw_recording_active_ = true;
   RCLCPP_INFO(
     get_logger(), "Started OpenEB raw recording: %s (metadata: %s)",
@@ -389,19 +428,16 @@ void DriverComponent::start_raw_recording()
     current_raw_recording_metadata_path_.string().c_str());
 }
 
-void DriverComponent::stop_raw_recording() noexcept
+bool DriverComponent::stop_raw_recording() noexcept
 {
   std::lock_guard<std::mutex> lock(raw_recording_mutex_);
   if (!raw_recording_active_) {
-    return;
+    return true;
   }
 
   try {
-    if (!current_raw_recording_path_.empty()) {
-      camera_.stop_recording(current_raw_recording_path_);
-    } else {
-      camera_.stop_recording();
-    }
+    // Stop every writer owned by this camera, including an old writer after a failed split.
+    camera_.stop_recording();
     RCLCPP_INFO(
       get_logger(), "Stopped OpenEB raw recording: %s",
       current_raw_recording_path_.string().c_str());
@@ -409,21 +445,24 @@ void DriverComponent::stop_raw_recording() noexcept
     RCLCPP_ERROR(
       get_logger(), "Failed to stop OpenEB raw recording cleanly: %s",
       error.what());
+    return false;
   }
   raw_recording_active_ = false;
   current_raw_recording_path_.clear();
   current_raw_recording_metadata_path_.clear();
+  return true;
 }
 
-void DriverComponent::rotate_raw_recording()
+bool DriverComponent::rotate_raw_recording()
 {
   std::lock_guard<std::mutex> lock(raw_recording_mutex_);
   try {
     if (!raw_recording_enabled_ || !camera_open_ || !raw_recording_active_) {
-      return;
+      return false;
     }
 
     const auto previous_path = current_raw_recording_path_;
+    const auto previous_metadata_path = current_raw_recording_metadata_path_;
     const auto next_path = make_raw_recording_path();
     const auto system_start_time = std::chrono::system_clock::now();
     const auto ros_start_time = now();
@@ -434,8 +473,14 @@ void DriverComponent::rotate_raw_recording()
     }
 
     current_raw_recording_path_ = next_path;
-    write_raw_recording_metadata(
-      current_raw_recording_path_, system_start_time, ros_start_time);
+    try {
+      write_raw_recording_metadata(current_raw_recording_path_, system_start_time, ros_start_time);
+    } catch (...) {
+      camera_.stop_recording(next_path);
+      current_raw_recording_path_ = previous_path;
+      current_raw_recording_metadata_path_ = previous_metadata_path;
+      throw;
+    }
     if (!previous_path.empty()) {
       try {
         camera_.stop_recording(previous_path);
@@ -444,15 +489,18 @@ void DriverComponent::rotate_raw_recording()
           get_logger(),
           "Failed to stop previous OpenEB raw recording '%s': %s",
           previous_path.string().c_str(), error.what());
+        return false;
       }
     }
 
     RCLCPP_INFO(
       get_logger(), "Rotated OpenEB raw recording: %s",
       current_raw_recording_path_.string().c_str());
+    return true;
   } catch (const std::exception & error) {
     RCLCPP_ERROR(
       get_logger(), "Failed to rotate OpenEB raw recording: %s", error.what());
+    return false;
   }
 }
 
@@ -465,7 +513,7 @@ std::filesystem::path DriverComponent::make_raw_recording_path()
 
   std::ostringstream filename;
   filename << basename << "_" << serial << "_" << make_timestamp_string();
-  if (raw_recording_split_duration_s_ > 0.0) {
+  {
     filename << "_" << std::setw(6) << std::setfill('0') << raw_recording_index_;
   }
   filename << ".raw";
@@ -519,6 +567,7 @@ void DriverComponent::write_raw_recording_metadata(
     RCLCPP_ERROR(
       get_logger(), "Failed to write OpenEB raw recording metadata '%s': %s",
       metadata_path.string().c_str(), error.what());
+    throw;
   }
 }
 
@@ -528,6 +577,14 @@ void DriverComponent::handle_start_raw_recording(
 {
   (void)request;
   try {
+    {
+      std::lock_guard<std::mutex> lock(raw_recording_mutex_);
+      if (raw_recording_active_) {
+        response->success = false;
+        response->message = "RAW recording is already active; START rejected";
+        return;
+      }
+    }
     start_raw_recording();
     std::string path;
     {
@@ -557,58 +614,22 @@ void DriverComponent::handle_stop_raw_recording(
     path = current_raw_recording_path_.string();
   }
 
-  stop_raw_recording();
-  response->success = true;
+  response->success = stop_raw_recording();
+  if (!response->success) {
+    response->message = "OpenEB RAW stop failed; writer state remains active";
+    return;
+  }
   response->message = was_active ?
     "OpenEB raw recording stopped: " + path :
     "OpenEB raw recording was not active";
 }
 
-void DriverComponent::handle_raw_recording_request(const BagRequest::SharedPtr request)
+void DriverComponent::handle_split_raw_recording(
+  const std::shared_ptr<Trigger::Request> request, std::shared_ptr<Trigger::Response> response)
 {
-  if (!request) {
-    return;
-  }
-
-  try {
-    if (request->command == BagRequest::START) {
-      const auto requested_path = std::filesystem::path(request->label);
-      const auto use_requested_directory =
-        !request->label.empty() && requested_path.is_absolute();
-      const auto safe_label = use_requested_directory ?
-        std::string() : sanitize_label(request->label);
-      {
-        std::lock_guard<std::mutex> lock(raw_recording_mutex_);
-        if (!raw_recording_active_) {
-          if (use_requested_directory) {
-            raw_recording_dir_ = requested_path.lexically_normal().string();
-          } else if (!safe_label.empty()) {
-            raw_recording_basename_ = safe_label;
-          }
-        }
-      }
-      start_raw_recording();
-      RCLCPP_INFO(get_logger(), "OpenEB raw recording START request accepted");
-    } else if (request->command == BagRequest::STOP) {
-      stop_raw_recording();
-      RCLCPP_INFO(get_logger(), "OpenEB raw recording STOP request accepted");
-    } else if (request->command == BagRequest::SPLIT) {
-      rotate_raw_recording();
-      RCLCPP_INFO(get_logger(), "OpenEB raw recording SPLIT request accepted");
-    } else if (request->command == BagRequest::MARK) {
-      RCLCPP_INFO(
-        get_logger(), "OpenEB raw recording MARK request: %s",
-        request->label.c_str());
-    } else {
-      RCLCPP_WARN(
-        get_logger(), "Unknown OpenEB raw recording request command: %u",
-        request->command);
-    }
-  } catch (const std::exception & error) {
-    RCLCPP_ERROR(
-      get_logger(), "Failed to handle OpenEB raw recording request: %s",
-      error.what());
-  }
+  (void)request;
+  response->success = rotate_raw_recording();
+  response->message = response->success ? "OpenEB RAW split completed" : "OpenEB RAW split failed or recording is idle";
 }
 
 void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t size)
@@ -619,7 +640,7 @@ void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t s
 
   const auto callback_start = std::chrono::steady_clock::now();
 
-  if (!has_output_subscribers()) {
+  if (!packet_sink_ && !has_output_subscribers()) {
     no_subscriber_callbacks_.fetch_add(1, std::memory_order_relaxed);
     pending_packet_.reset();
     pending_bytes_.store(0, std::memory_order_relaxed);
@@ -652,7 +673,7 @@ void DriverComponent::on_raw_data(const std::uint8_t * data, const std::size_t s
   const bool size_reached =
     pending_packet_->events.size() >= packet_size_bytes_;
 
-  if (duration_reached || size_reached) {
+  if (packet_sink_ || duration_reached || size_reached) {
     publish_pending_packet(steady_now);
   }
 
@@ -682,11 +703,16 @@ void DriverComponent::publish_pending_packet(
     }
   }
   reserve_size_ = std::max(reserve_size_, packet_bytes);
-  published_messages_.fetch_add(1, std::memory_order_relaxed);
-  published_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
-  published_messages_total_.fetch_add(1, std::memory_order_relaxed);
-  last_published_sequence_.store(packet_sequence, std::memory_order_relaxed);
-  event_publisher_->publish(std::move(pending_packet_));
+  const bool publish_packet = has_output_subscribers();
+  if (publish_packet) {
+    published_messages_.fetch_add(1, std::memory_order_relaxed);
+    published_bytes_.fetch_add(packet_bytes, std::memory_order_relaxed);
+    published_messages_total_.fetch_add(1, std::memory_order_relaxed);
+    last_published_sequence_.store(packet_sequence, std::memory_order_relaxed);
+  }
+  route_packet(std::move(pending_packet_), packet_sink_,
+    [this](EventPacket::UniquePtr packet) { event_publisher_->publish(std::move(packet)); },
+    publish_packet);
   pending_bytes_.store(0, std::memory_order_relaxed);
   last_publish_time_ = publish_time;
   has_published_ = true;
@@ -694,8 +720,9 @@ void DriverComponent::publish_pending_packet(
 
 bool DriverComponent::has_output_subscribers() const
 {
-  return event_publisher_->get_subscription_count() > 0 ||
-         event_publisher_->get_intra_process_subscription_count() > 0;
+  return packet_publish_enabled_.load(std::memory_order_acquire) &&
+    (event_publisher_->get_subscription_count() > 0 ||
+     event_publisher_->get_intra_process_subscription_count() > 0);
 }
 
 void DriverComponent::record_raw_callback(
@@ -841,8 +868,9 @@ void DriverComponent::print_statistics()
       make_key_value("interarrival_max_us", interarrival_max_ns / ns_per_us),
       make_key_value("no_subscriber", no_subscriber),
       make_key_value("raw_recording_enabled", raw_recording_enabled_),
-      make_key_value("raw_recording_request_topic", raw_recording_request_topic_),
       make_key_value("raw_recording_auto_start", raw_recording_auto_start_),
+      make_key_value("packet_publish_enabled", packet_publish_enabled_.load()),
+      make_key_value("packet_input_path", std::string(packet_sink_ ? "direct" : "topic")),
       make_key_value("raw_recording_active", raw_recording_active),
       make_key_value(
         "raw_recording_split_duration_s",

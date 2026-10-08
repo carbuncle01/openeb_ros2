@@ -1,0 +1,30 @@
+/**/event_tensor:
+  ros__parameters:
+    bins: 10
+    width: 212
+    height: 120
+    window_ms: 40.0
+    stride_ms: 4.0
+    output_rate_hz: 0.0
+    polarity_mode: "separate"
+    polarity_layout: "polarity_major"
+    temporal_interpolation: "none"
+    incremental_mode: "auto"
+    representation_backend: "cpu"
+    inference_policy: "periodic"
+    cuda_update_us: 1000
+    timestamp_backward_tolerance_us: 4000
+    cuda_events_per_transfer: 8192
+    inference_watchdog_ms: 100.0
+    tensor_name: "input_tensor"
+    channel_mean: [0.0]
+    channel_stddev: [1.0]
+    publish_empty: true
+    use_pinned_host_memory: true
+    debug: false
+    statistics_interval_s: 1.0
+    subscription_depth: 8
+    publisher_depth: 4
+    staging_buffer_count: 8
+    diagnostics_topic: "tensor_diagnostics"
+    subscribe_packets: false

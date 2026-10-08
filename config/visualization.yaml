@@ -1,0 +1,24 @@
+/**/event_preprocessor:
+  ros__parameters:
+    packet_forward_enabled: false
+    subscribe_packets: false
+    image_queue_capacity: 4
+    image_queue_max_bytes: 8388608
+    image_queue_max_age_ms: 100.0
+    expected_encoding: "evt3"
+    output_frame_id: ""
+    drop_empty_packets: true
+    drop_unexpected_encoding: true
+    event_image_enabled: true
+    event_image_fps: 25.0
+    event_image_window_ms: 40.0
+    event_image_stride_ms: 40.0
+    event_image_encoding: "bgr8"
+    event_image_style: "red_blue_white"
+    event_image_percentile: 90.0
+    event_image_publish_empty: true
+    debug: false
+    subscription_depth: 8
+    publisher_depth: 8
+    event_image_publisher_depth: 2
+    statistics_interval_s: 1.0

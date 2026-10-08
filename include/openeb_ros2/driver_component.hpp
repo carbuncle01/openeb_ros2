@@ -7,12 +7,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <string>
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <event_camera_msgs/msg/event_packet.hpp>
-#include <jetpilot_msgs/msg/bag_request.hpp>
 #include <metavision/sdk/stream/camera.h>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -23,20 +23,21 @@ namespace openeb_ros2
 class DriverComponent : public rclcpp::Node
 {
 public:
+  using PacketSink = std::function<void(event_camera_msgs::msg::EventPacket::UniquePtr)>;
+  DriverComponent(const rclcpp::NodeOptions & options, PacketSink sink);
   explicit DriverComponent(const rclcpp::NodeOptions & options);
   ~DriverComponent() override;
 
 private:
   using EventPacket = event_camera_msgs::msg::EventPacket;
   using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
-  using BagRequest = jetpilot_msgs::msg::BagRequest;
   using Trigger = std_srvs::srv::Trigger;
 
   void open_camera();
   void stop_camera() noexcept;
   void start_raw_recording();
-  void stop_raw_recording() noexcept;
-  void rotate_raw_recording();
+  bool stop_raw_recording() noexcept;
+  bool rotate_raw_recording();
   std::filesystem::path make_raw_recording_path();
   void write_raw_recording_metadata(
     const std::filesystem::path & raw_path,
@@ -45,10 +46,12 @@ private:
   void handle_start_raw_recording(
     const std::shared_ptr<Trigger::Request> request,
     std::shared_ptr<Trigger::Response> response);
+  void handle_split_raw_recording(
+    const std::shared_ptr<Trigger::Request> request,
+    std::shared_ptr<Trigger::Response> response);
   void handle_stop_raw_recording(
     const std::shared_ptr<Trigger::Request> request,
     std::shared_ptr<Trigger::Response> response);
-  void handle_raw_recording_request(const BagRequest::SharedPtr request);
   void on_raw_data(const std::uint8_t * data, std::size_t size);
   void publish_pending_packet(
     const std::chrono::steady_clock::time_point & publish_time);
@@ -58,6 +61,10 @@ private:
     std::size_t bytes);
   void print_statistics();
 
+  PacketSink packet_sink_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr configuration_guard_;
+  std::atomic<bool> packet_publish_enabled_{true};
+  rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr packet_parameter_callback_;
   Metavision::Camera camera_;
   bool camera_open_{false};
   bool camera_running_{false};
@@ -69,9 +76,9 @@ private:
 
   rclcpp::Publisher<EventPacket>::SharedPtr event_publisher_;
   rclcpp::Publisher<DiagnosticArray>::SharedPtr diagnostics_publisher_;
-  rclcpp::Subscription<BagRequest>::SharedPtr raw_recording_request_sub_;
   rclcpp::Service<Trigger>::SharedPtr start_raw_recording_service_;
   rclcpp::Service<Trigger>::SharedPtr stop_raw_recording_service_;
+  rclcpp::Service<Trigger>::SharedPtr split_raw_recording_service_;
   rclcpp::TimerBase::SharedPtr statistics_timer_;
   rclcpp::TimerBase::SharedPtr raw_recording_split_timer_;
   EventPacket::UniquePtr pending_packet_;
@@ -81,7 +88,6 @@ private:
   std::string bias_file_;
   std::string encoding_;
   std::string frame_id_;
-  std::string raw_recording_request_topic_;
   std::string raw_recording_dir_;
   std::string raw_recording_basename_;
   std::int64_t packet_duration_us_{1000};
