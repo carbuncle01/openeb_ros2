@@ -55,3 +55,23 @@ CPU側のstaging_buffer_countとasyncのdecode buffer poolは独立して維持�
   画像headerはpacket receiptへの推定対応であり、hardware synchronizationの主張には使わない。
 - RAW保存先変更は停止中だけ。START/STOP/SPLITの失敗をサービス応答へ返す。
   splitには独立した連番を付け、driver timerなしのmanager splitでもファイル名を重複させない。
+
+## 学習用の時刻メタデータ
+
+3方式ともTensor出版後に`/event_camera/tensor_timing`（std_msgs/msg/String、JSON v1）を
+出版する。reliable/volatile/depth 512、Tensorと同周期（既定250 Hz）、購読者あり時のみ。
+追加parameterなし。GPU Tensor本体は記録不要。OpenEB用bag profileはこのtopicを記録する。
+JSONはstream_id、sequence、sensor_epoch、tensor_stamp_ros_ns、generated_ros_ns、
+window_start/end_sensor_us、sensor_to_ros_offset_ns、window_start/end_ros_ns、
+latest_event_sensor_us、tensor_name、frame_id、shapeを含む。
+窓は半開区間[start,end)。header stampと窓終端は同一とは限らない。
+sequenceは成功したTensor出版ごとに増加、リセット時sensor_epochが増える。
+メタデータとTensorの出版は別メッセージなのでatomicではなく、欠落はsequenceで確認する。
+
+offsetは毎snapshotのpacket受信ROS時刻−最新イベントセンサ時刻から得る推定値。
+USB遅延/queue遅延とclock変動が入り、hardware sync精度を保証しない。
+RAWの0始まりはreaderのtime shiftingに依存する。recording_start_ros_timeを
+RAWの0秒へ直接足さない。HALのget_timestamp_shift()でファイルごとのshiftを取得し、
+`ros_ns=(raw_relative_us+raw_sensor_shift_us)*1000+sensor_to_ros_offset_ns`で対応付ける。
+RAW splitごとにshiftを取得し、timestamp reset/rolloverはepoch別に扱う。
+SDK実装: https://github.com/prophesee-ai/openeb/blob/5.2.0/hal/cpp/include/metavision/hal/facilities/i_events_stream_decoder.h

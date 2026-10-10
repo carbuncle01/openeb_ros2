@@ -47,3 +47,7 @@ GPU tensor payloadへの追加購読なしのrunも比較する。
 - kart側RawRelayの12テストを含む21テストが通過。保存先設定後のSTART、処理中STOP、
   directory拒否時の手動RAW保護、サービス利用不可・応答timeout、split、次sessionを確認。
 - RAWサービス実結合、同一directoryでのMCAP/RAW生成、画像workerの実入力・周期・headerは未確認。
+
+Tensor timing: portable ROS-stub serialization/JSON/integer mapping/epoch/sequence checks passed.
+check_configuration.py passed. No actual ROS publication, SDK RAW shift extraction, GPU or sync validation.
+Run test/check_timing.py to repeat the portable check; stubs do not establish ROS integration.
