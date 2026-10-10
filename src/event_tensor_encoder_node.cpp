@@ -284,6 +284,7 @@ EventTensorEncoderNode::EventTensorEncoderNode(const rclcpp::NodeOptions & optio
       std::bind(&EventTensorEncoderNode::on_packet, this, std::placeholders::_1),
       subscription_options);
   }
+  tensor_timing_ = std::make_unique<TensorTiming>(*this);
   tensor_publisher_ = create_publisher<TensorList>("tensor", output_qos, publisher_options);
   if (representation_backend_ == "cuda" && inference_policy_ == "consumer_driven") {
     inference_feedback_subscription_ = create_subscription<TensorList>(
@@ -630,6 +631,8 @@ void EventTensorEncoderNode::maybe_publish_cuda_snapshot(const Timestamp window_
     cuda_ring_dirty_ = false;
     const auto publish_start = std::chrono::steady_clock::now();
     tensor_publisher_->publish(tensor_list);
+    tensor_timing_->publish(header, window_end_us-window_us_, window_end_us,
+      sensor_to_ros_offset_ns_, last_event_us_, tensor_name_, channels_, height_, width_);
     const auto publish_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - publish_start).count());
@@ -798,6 +801,8 @@ void EventTensorEncoderNode::publish_window(
     header.frame_id = frame_id;
     auto tensor_list = make_tensor_list(header, tensor_name_, std::move(tensor));
     tensor_publisher_->publish(tensor_list);
+    tensor_timing_->publish(header, window_end_us-window_us_, window_end_us,
+      sensor_to_ros_offset_ns_, last_event_us_, tensor_name_, channels_, height_, width_);
     const auto transfer_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - transfer_start).count());
@@ -958,6 +963,7 @@ bool EventTensorEncoderNode::accept_event_timestamp(const Timestamp event_us)
 
 void EventTensorEncoderNode::reset_state(const std::string & reason)
 {
+  tensor_timing_->reset_epoch();
   window_events_.clear();
   cuda_pending_events_.clear();
   if (cuda_backend_ && cuda_stream_) {

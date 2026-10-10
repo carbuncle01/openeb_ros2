@@ -548,7 +548,7 @@ void DriverComponent::write_raw_recording_metadata(
       << "recording_start_ros_time_sec: " << ros_start_time.seconds() << "\n"
       << "recording_start_ros_time_nanoseconds: " << ros_start_time.nanoseconds() << "\n"
       << "timestamp_reference: "
-      << yaml_quote("Metavision RAW event timestamps are relative to this recording start.")
+      << yaml_quote("RAW reader may shift timestamps to its first stream timestamp; recording_start_ros_time is not the RAW zero-time anchor.")
       << "\n"
       << "frame_id: " << yaml_quote(frame_id_) << "\n"
       << "serial: " << yaml_quote(serial_) << "\n"

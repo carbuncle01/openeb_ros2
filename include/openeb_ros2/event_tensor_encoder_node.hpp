@@ -1,3 +1,4 @@
+#include "openeb_ros2/tensor_timing.hpp"
 #ifndef OPENEB_ROS2__EVENT_TENSOR_ENCODER_NODE_HPP_
 #define OPENEB_ROS2__EVENT_TENSOR_ENCODER_NODE_HPP_
 
@@ -152,6 +153,7 @@ private:
   nvidia::isaac_ros::common::CudaStreamPtr cuda_stream_;
   rclcpp::Subscription<EventPacket>::SharedPtr event_subscription_;
   rclcpp::Subscription<TensorList>::SharedPtr inference_feedback_subscription_;
+  std::unique_ptr<TensorTiming> tensor_timing_;
   rclcpp::Publisher<TensorList>::SharedPtr tensor_publisher_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;

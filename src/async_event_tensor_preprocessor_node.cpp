@@ -237,6 +237,7 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
       std::bind(&AsyncEventTensorPreprocessorNode::on_packet, this, std::placeholders::_1),
       subscription_options);
   }
+  tensor_timing_ = std::make_unique<TensorTiming>(*this);
   tensor_publisher_ = create_publisher<TensorList>(
     "tensor",
     rclcpp::QoS(rclcpp::KeepLast(static_cast<std::size_t>(publisher_depth)))
@@ -672,6 +673,7 @@ void AsyncEventTensorPreprocessorNode::gpu_loop()
 void AsyncEventTensorPreprocessorNode::apply_chunk(DecodedWork & work)
 {
   if (work.reset_before) {
+    tensor_timing_->reset_epoch();
     cuda_backend_->reset(*cuda_stream_);
     publish_schedule_origin_us_ = 0;
     next_window_target_us_ = 0;
@@ -801,6 +803,9 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
     update_max(window_end_age_max_ns_, window_end_age_ns);
     auto message = make_tensor_list(header, tensor_name_, std::move(tensor));
     tensor_publisher_->publish(message);
+    tensor_timing_->publish(header, window_end_us-window_us_, window_end_us,
+      sensor_to_ros_offset_ns_, (latest_event_ros_ns-sensor_to_ros_offset_ns_)/1000LL,
+      tensor_name_, channels_, height_, width_);
     last_header_timestamp_ns_ = timestamp_ns;
     published_tensors_.fetch_add(1, std::memory_order_relaxed);
 
