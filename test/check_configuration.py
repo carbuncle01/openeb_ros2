@@ -35,7 +35,9 @@ def main():
         if config.startswith("tensor_"):
             assert not actual["subscribe_packets"]
             assert actual["bins"] == 10 and actual["polarity_mode"] == "separate"
-            assert actual["width"] == 212 and actual["height"] == 120
+            assert actual["width"] == 160 and actual["height"] == 120
+            assert re.search(r'declare_parameter<std::int64_t>\("width", 160\)',
+                             (ROOT / "src" / source).read_text())
     for config in ("driver_bag_linked.yaml",):
         assert parameters(ROOT / "src/driver_component.cpp") == configured(ROOT / "config" / config).keys()
         linked = configured(ROOT / "config" / config)

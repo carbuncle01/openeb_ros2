@@ -94,7 +94,7 @@ private:
   std::int64_t aligned_window_end(std::int64_t target_us) const;
 
   std::int64_t bins_{10};
-  std::int64_t width_{212};
+  std::int64_t width_{160};
   std::int64_t height_{120};
   std::int64_t window_us_{40000};
   std::int64_t stride_us_{4000};

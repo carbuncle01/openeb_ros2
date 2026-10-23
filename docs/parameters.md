@@ -58,7 +58,7 @@ config/tensor_*.yamlはdirect pipeline向けのsubscribe_packets=false。単体c
 | 名前 | 基準値 | 意味 |
 |---|---|---|
 | `bins` | `10` | 時間bin数。 |
-| `width` | `212` | 出力tensor幅[pixel]。 |
+| `width` | `160` | 出力tensor幅[pixel]。 |
 | `height` | `120` | 出力tensor高さ[pixel]。 |
 | `window_ms` | `40.0` | イベント蓄積窓[ms]。 |
 | `stride_ms` | `4.0` | 表現の更新間隔[ms]。 |
@@ -91,7 +91,7 @@ config/tensor_*.yamlはdirect pipeline向けのsubscribe_packets=false。単体c
 | 名前 | 基準値 | 意味 |
 |---|---|---|
 | `bins` | `10` | 時間bin数。 |
-| `width` | `212` | 出力tensor幅[pixel]。 |
+| `width` | `160` | 出力tensor幅[pixel]。 |
 | `height` | `120` | 出力tensor高さ[pixel]。 |
 | `window_ms` | `40.0` | イベント蓄積窓[ms]。 |
 | `stride_ms` | `4.0` | 表現の更新間隔[ms]。 |
@@ -124,7 +124,7 @@ config/tensor_*.yamlはdirect pipeline向けのsubscribe_packets=false。単体c
 | 名前 | 基準値 | 意味 |
 |---|---|---|
 | `bins` | `10` | 時間bin数。 |
-| `width` | `212` | 出力tensor幅[pixel]。 |
+| `width` | `160` | 出力tensor幅[pixel]。 |
 | `height` | `120` | 出力tensor高さ[pixel]。 |
 | `window_ms` | `40.0` | イベント蓄積窓[ms]。 |
 | `stride_ms` | `4.0` | 表現の更新間隔[ms]。 |

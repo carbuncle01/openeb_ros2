@@ -17,7 +17,7 @@
   tensor_msgs/msg/ExperimentalTensorのdataをCUDA buffer backendで確保する。
   CUDA snapshotは出力bufferに直接書く。CPU表現はH2Dを伴う。
   転送zero-copyは取得から全工程でコピーがないという意味ではない。
-- NCHW FP32、N=1、既定[1,20,120,212]。channel/bin順・正規化・window/strideは学習契約と一致させる。
+- NCHW FP32、N=1、既定[1,20,120,160]。channel/bin順・正規化・window/strideは学習契約と一致させる。
 - WriteHandleの寿命内でCUDA処理をenqueueし、破棄による完了event記録後にpublishする。
   subscriberはfrom_input_bufferを使い、handle/messageの寿命を守る。
   GPU共有条件が満たされない場合のCPU fallbackと実測の転送挙動を区別する。

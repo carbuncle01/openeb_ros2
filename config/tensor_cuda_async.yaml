@@ -1,7 +1,7 @@
 /**/event_tensor:
   ros__parameters:
     bins: 10
-    width: 212
+    width: 160
     height: 120
     window_ms: 40.0
     stride_ms: 4.0

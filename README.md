@@ -111,7 +111,7 @@ ROS標準のrosout/parameter_events等は一覧から省略。
 
 ## NCHWとzero-copy
 
-既定shapeは **[1,20,120,212]**（10 bins × ON/OFF）、contiguous FP32。
+既定shapeは **[1,20,120,160]**（10 bins × ON/OFF）、contiguous FP32。
 モデルの入力名、shape、window、stride、極性順、正規化を一致させる。
 CUDA方式ではsnapshot kernelがCUDA-backed ExperimentalTensor.dataへ直接書き、
 WriteHandleを閉じてから標準TensorListをpublishする。CPU方式はH2Dが必要。

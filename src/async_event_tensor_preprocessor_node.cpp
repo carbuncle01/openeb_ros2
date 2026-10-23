@@ -104,7 +104,7 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
 : Node("async_event_tensor_preprocessor", options)
 {
   bins_ = declare_parameter<std::int64_t>("bins", 10);
-  width_ = declare_parameter<std::int64_t>("width", 212);
+  width_ = declare_parameter<std::int64_t>("width", 160);
   height_ = declare_parameter<std::int64_t>("height", 120);
   const auto window_ms = declare_parameter<double>("window_ms", 40.0);
   const auto stride_ms = declare_parameter<double>("stride_ms", 4.0);
