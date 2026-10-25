@@ -118,7 +118,7 @@ public:
     const std::size_t width, const std::size_t height, const std::size_t bins,
     const bool separate, const bool polarity_major, const std::int64_t window_us,
     const std::size_t batch_capacity, const std::vector<double> & channel_mean,
-    const std::vector<double> & channel_stddev)
+    const std::vector<double> & channel_stddev, const bool enable_event_staging)
   : width_(width), height_(height), bins_(bins), separate_(separate),
     polarity_major_(polarity_major), window_us_(window_us),
     bin_width_us_(window_us / static_cast<std::int64_t>(bins)),
@@ -154,7 +154,7 @@ public:
       cudaMemcpy(stddevs_, stddevs.data(), channels_ * sizeof(float), cudaMemcpyHostToDevice),
       "copy channel stddevs");
 
-    for (auto & slot : transfer_slots_) {
+    if (enable_event_staging) for (auto & slot : transfer_slots_) {
       check_cuda(
         cudaMallocHost(&slot.host, batch_capacity_ * sizeof(CudaEvent)),
         "cudaMallocHost event staging");
@@ -165,16 +165,33 @@ public:
         cudaEventCreateWithFlags(&slot.complete, cudaEventDisableTiming),
         "cudaEventCreate event staging");
     }
+    if (!enable_event_staging) initialize_bin_slots();
+  }
+
+  void initialize_bin_slots()
+  {
+    if (bin_slots_ready_) return;
+    for (auto & slot : bin_transfer_slots_) {
+      if (slot.host == nullptr) check_cuda(
+        cudaMallocHost(&slot.host, pixels_*(separate_ ? 2U:1U)*sizeof(float)), "cudaMallocHost bin staging");
+      if (slot.complete == nullptr) check_cuda(
+        cudaEventCreateWithFlags(&slot.complete, cudaEventDisableTiming), "cudaEventCreate bin staging");
+    }
+    bin_slots_ready_ = true;
   }
 
   ~Impl()
   {
-    if (last_stream_ != nullptr) {
+    if (has_stream_work_) {
       (void)cudaStreamSynchronize(last_stream_);
     }
     for (auto & slot : transfer_slots_) {
       if (slot.complete != nullptr) {(void)cudaEventDestroy(slot.complete);}
       if (slot.device != nullptr) {(void)cudaFree(slot.device);}
+      if (slot.host != nullptr) {(void)cudaFreeHost(slot.host);}
+    }
+    for (auto & slot : bin_transfer_slots_) {
+      if (slot.complete != nullptr) {(void)cudaEventDestroy(slot.complete);}
       if (slot.host != nullptr) {(void)cudaFreeHost(slot.host);}
     }
     if (stddevs_ != nullptr) {(void)cudaFree(stddevs_);}
@@ -185,8 +202,10 @@ public:
   void reset(const cudaStream_t stream)
   {
     last_stream_ = stream;
+    has_stream_work_ = true;
     check_cuda(cudaMemsetAsync(ring_, 0, ring_bytes_, stream), "reset rolling ring");
     initialized_ = false;
+    has_bin_epoch_ = false;
     origin_timestamp_us_ = 0;
     latest_timestamp_us_ = 0;
     accepted_events_ = 0;
@@ -200,7 +219,10 @@ public:
     if (events == nullptr || event_count == 0U) {
       return;
     }
+    if (has_bin_epoch_ || transfer_slots_[0].host == nullptr)
+      throw std::logic_error("Event updates are unavailable for this bin-transfer backend");
     last_stream_ = stream;
+    has_stream_work_ = true;
     const auto newest_timestamp = events[event_count - 1U].timestamp_us;
     if (newest_timestamp < 0) {
       discarded_events_ += event_count;
@@ -261,6 +283,47 @@ public:
     accepted_events_ += event_count;
   }
 
+  void update_bins(const HistogramBinUpdates & update, const cudaStream_t stream)
+  {
+    update.validate(width_, height_, bins_, separate_, polarity_major_, bin_width_us_);
+    if (initialized_ && !has_bin_epoch_)
+      throw std::logic_error("Reset before switching from event updates to bin updates");
+    const bool new_epoch = !has_bin_epoch_ || update.epoch != bin_epoch_;
+    if (!new_epoch && (update.origin_us != origin_timestamp_us_ ||
+      update.newest_bin < newest_bin_ || update.latest_us < latest_timestamp_us_))
+      throw std::invalid_argument("Out-of-order absolute bin update");
+    last_stream_ = stream;
+    has_stream_work_ = true;
+    try {
+      initialize_bin_slots();
+      if (new_epoch) check_cuda(cudaMemsetAsync(ring_, 0, ring_bytes_, stream), "reset bin-transfer ring");
+      const auto planes = separate_ ? 2U:1U;
+      for (std::size_t i=0; i<update.slots.size(); ++i) {
+        auto & staging = bin_transfer_slots_[next_bin_transfer_slot_];
+        next_bin_transfer_slot_ = (next_bin_transfer_slot_+1U)%bin_transfer_slots_.size();
+        if (staging.pending) check_cuda(cudaEventSynchronize(staging.complete), "wait for bin staging");
+        std::memcpy(staging.host, update.values.data()+i*planes*pixels_, planes*pixels_*sizeof(float));
+        for (std::size_t p=0; p<planes; ++p) {
+          const auto channel = separate_ ?
+            (polarity_major_ ? p*ring_bins_+update.slots[i] : update.slots[i]*2U+p) : update.slots[i];
+          check_cuda(cudaMemcpyAsync(ring_+channel*pixels_, staging.host+p*pixels_,
+            pixels_*sizeof(float), cudaMemcpyHostToDevice, stream), "upload dirty histogram plane");
+        }
+        check_cuda(cudaEventRecord(staging.complete, stream), "record bin staging completion");
+        staging.pending = true;
+      }
+      origin_timestamp_us_ = update.origin_us;
+      newest_bin_ = update.newest_bin; latest_timestamp_us_ = update.latest_us;
+      bin_epoch_ = update.epoch; has_bin_epoch_ = true; initialized_ = true;
+    } catch (...) {
+      // An upload may have enqueued one plane before failing. Its pinned host
+      // storage must survive until pending DMA is done, even on the error path.
+      (void)cudaStreamSynchronize(stream);
+      initialized_ = false; has_bin_epoch_ = false;
+      throw;
+    }
+  }
+
   void snapshot(
     float * output, const std::int64_t window_end_us, const cudaStream_t stream)
   {
@@ -273,6 +336,7 @@ public:
     }
     const auto window_end_bin = elapsed_us / bin_width_us_;
     last_stream_ = stream;
+    has_stream_work_ = true;
     constexpr std::size_t threads = 256U;
     const auto count = channels_ * pixels_;
     const auto blocks = static_cast<unsigned int>((count + threads - 1U) / threads);
@@ -301,6 +365,15 @@ public:
     bool pending{false};
   };
 
+  struct BinTransferSlot {
+    float * host{nullptr};
+    cudaEvent_t complete{nullptr};
+    bool pending{false};
+  };
+  std::vector<BinTransferSlot> bin_transfer_slots_{4};
+  std::size_t next_bin_transfer_slot_{0};
+  bool bin_slots_ready_{false}, has_bin_epoch_{false};
+  std::uint64_t bin_epoch_{0};
   std::size_t width_;
   std::size_t height_;
   std::size_t bins_;
@@ -320,6 +393,7 @@ public:
   std::vector<TransferSlot> transfer_slots_{4};
   std::size_t next_transfer_slot_{0};
   cudaStream_t last_stream_{nullptr};
+  bool has_stream_work_{false};
   bool initialized_{false};
   std::int64_t origin_timestamp_us_{0};
   std::int64_t newest_bin_{0};
@@ -332,10 +406,11 @@ EventTensorCudaBackend::EventTensorCudaBackend(
   const std::size_t width, const std::size_t height, const std::size_t bins,
   const bool separate_polarities, const bool polarity_major,
   const std::int64_t window_us, const std::size_t batch_capacity,
-  const std::vector<double> & channel_mean, const std::vector<double> & channel_stddev)
+  const std::vector<double> & channel_mean, const std::vector<double> & channel_stddev,
+  const bool enable_event_staging)
 : impl_(std::make_unique<Impl>(
       width, height, bins, separate_polarities, polarity_major, window_us,
-      batch_capacity, channel_mean, channel_stddev))
+      batch_capacity, channel_mean, channel_stddev, enable_event_staging))
 {
 }
 
@@ -353,6 +428,12 @@ void EventTensorCudaBackend::update(
   const CudaEvent * const events, const std::size_t count, const cudaStream_t stream)
 {
   impl_->update(events, count, stream);
+}
+
+void EventTensorCudaBackend::update_bins(
+  const HistogramBinUpdates & updates, const cudaStream_t stream)
+{
+  impl_->update_bins(updates, stream);
 }
 
 void EventTensorCudaBackend::snapshot(

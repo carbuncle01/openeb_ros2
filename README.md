@@ -215,3 +215,138 @@ RAWの0秒へ直接足さない。HALのget_timestamp_shift()でファイルご�
 `ros_ns=(raw_relative_us+raw_sensor_shift_us)*1000+sensor_to_ros_offset_ns`で対応付ける。
 RAW splitごとにshiftを取得し、timestamp reset/rolloverはepoch別に扱う。
 SDK実装: https://github.com/prophesee-ai/openeb/blob/5.2.0/hal/cpp/include/metavision/hal/facilities/i_events_stream_decoder.h
+
+## cuda_asyncの直接集計（opt-in）
+
+`event_aggregation`（string、既定`events`、起動時固定）で選択する。
+`events`は従来のevent配列・GPU ring方式。`evt3_runs`は受信済みEVT3 byte列の
+連続ADDR_Xで時刻・行・binの準備を共有し、CPU ringへ直接加算する。
+VECT12/VECT8も処理する。イベント配列・event staging・event H2Dは作らない。
+SDK bufferから所有するRAW byte bufferへのコピーは維持し、workerは所有bufferを
+処理完了まで保持する。queue容量・年齢上限・停止joinは既存のものを使用する。
+
+既存`openeb_ros2::AsyncEventTensorPreprocessorNode`、実行ファイル
+`async_event_tensor_preprocessor_node`、既定単体node名`async_event_tensor_preprocessor`を使用。
+統合起動時のnode名`/event_camera/event_tensor`と入出力は既存と同じ。
+`/event_camera/tensor`はisaac_ros_tensor_msgs/msg/TensorList（reliable/volatile/depth 8）、
+`/event_camera/tensor_timing`はstd_msgs/msg/String（reliable/volatile/depth 512）、
+`/event_camera/tensor_diagnostics`はdiagnostic_msgs/msg/DiagnosticArray（depth 10）。
+単体でsubscribe_packets=trueの場合のみevents（event_camera_msgs/msg/EventPacket、
+best effort/volatile/depth 16）を購読。direct pipelineでは購読を強制OFFにする。
+
+```bash
+ros2 launch openeb_ros2 tensor.launch.py tensor_backend:=cuda_async \
+  tensor_config:="$(ros2 pkg prefix openeb_ros2)/share/openeb_ros2/config/tensor_cuda_async_runs.yaml"
+```
+
+通常profileの既定はeventsを維持する。runs profileは全parameterを保持し、
+event_aggregationだけをevt3_runsへ変更したもの。変更には再起動が必要。
+channel/polarity順、半開時間窓、空binの減衰、shape、正規化、TensorTimingを維持する。
+初期時刻確定・24bit rollover・小さいTIME_HIGH逆行の扱いは
+[event_camera_codecs](https://github.com/ros-event-camera/event_camera_codecs/blob/master/include/event_camera_codecs/evt3_decoder.h)
+に合わせる。packetは偶数byteのEVT3限定。他encoding・未知code・不正packetはエラーにして
+stateをresetし、自動で別decoderへ切り替えない。trigger/monitorはTensorへ含めない。
+seq欠落/逆順、geometry変更、decoderエラーはparser/ringをresetし、
+次の有効時刻から新epochとして再開する。小さいCD時刻逆行は許容閾値まで破棄する。
+
+この初版は完成FP32 Tensor全体をGPUへ転送し、転送完了後にCPU snapshot bufferを
+再利用する。既定shape・250Hzでは約384 MB/sのpayload。更新binだけのGPU転送は未実装。
+CPU decodeとsnapshotのstate参照はmutexで保護する。packet処理がsnapshotを待たせる
+可能性があり、Macでの単独algorithm速度をROS/Orinの周期保証と解釈しない。
+診断event_aggregation/tensor_uploadで採用方式を確認する。decoded queue/poolと
+GPU event transferに関する既存parameter・診断はevt3_runsでは未使用。
+実データの出力比較は同じsensor epoch・window_start/endで行う。異なる負荷条件下の
+wall timerによる出版回数・header・欠落の一致まではalgorithmの一致試験に含めない。
+
+```bash
+# ROS/CUDA不要のcore試験
+c++ -std=c++17 -O2 -Wall -Wextra -Werror -I include \
+  test/evt3_runs_histogram_test.cpp -o /tmp/evt3_runs_histogram_test
+/tmp/evt3_runs_histogram_test
+# installed event_camera_codecsとの合成照合、およびGPU集計との照合はcolcon testへ登録
+colcon test --packages-select openeb_ros2
+colcon test-result --verbose
+# build直下の比較ツールは全RAWの全Tensorをmemcmpで照合できる
+./build/openeb_ros2/evt3_runs_codec_equivalence_test --raw /absolute/path/camera.raw
+```
+
+Macで公式decoderとの全RAW照合とcore単体試験を実施。ROS/SDK/CUDAビルド、GPU比較、
+USBカメラ、TensorRT接続、Orin性能は未確認。[検証記録](docs/validation.md)を参照。
+
+## 直接集計とGPU Tensor生成の併用
+
+`event_aggregation=evt3_runs_gpu`（起動時固定）を追加した。既定eventsとCPU版evt3_runsは維持。
+同じAsyncEventTensorPreprocessorNode、統合node /event_camera/event_tensor、既存入出力topic、
+QoS、shape、時刻窓、正規化parameterを使う。新しいROS node/topic/依存は追加しない。
+
+```text
+所有RAW buffer → CPUでEVT3 decode・bin集計
+             → 変更binの絶対値だけ転送
+             → GPU ring → CUDAで20ch Tensor構成・正規化 → TensorRT
+```
+
+```bash
+ros2 launch openeb_ros2 tensor.launch.py tensor_backend:=cuda_async \
+  tensor_config:="$(ros2 pkg prefix openeb_ros2)/share/openeb_ros2/config/tensor_cuda_async_runs_gpu.yaml"
+```
+
+新profileは全parameterを保持し、event_aggregationだけをevt3_runs_gpuにする。
+診断はevent_aggregation=evt3_runs_gpu / tensor_upload=dirty_cpu_binsを出す。
+CPU側は変更された時間slotを追跡し、読み取り中のbinも含めて必要なslotだけを取得する。
+ON/OFF planeを含むbinの絶対値を上書きするので、同じslotを再送しても二重加算しない。
+空binを作るためのclearも変更として転送。初回、epoch変更、大きい時刻jump、失敗後のretryは
+必要な全slotを再送する。小さい時刻逆行の許容・破棄方針（既定4ms）は変更しない。
+
+転送データはCPU ringから所有する更新bufferへコピーし、mutexを解放する。
+CUDA backendは4個の固定pinned bufferへbinをコピーし、完了eventを確認して再利用する。
+GPU ringへの非同期copyとsnapshot kernelは同じstreamにenqueueする。全TensorのH2Dも、
+event列のH2Dも行わない。GPUは既存make_snapshot kernelで画素/channelごとに並列処理する。
+更新binのsnapshotがCPUで完了した時点のstateを出版する。CPUの後続更新は次回に反映する。
+
+## GPU版の検証と比較
+
+MacでCUDA実行はできないため、bin export/絶対上書き/再構成のCPU模擬と公式decoderを比較した。
+全RAWの13,272 Tensorが全要素一致。初回全送信、変更なし、途中binの再更新、所有buffer寿命、
+同じupdateの再送、ring周回、空窓、epoch reset、失敗後の全再送、signed/layoutを単体確認。
+同一64KiB packet列・4ms窓境界でのH2D対象payloadは、全Tensor 20,385,792,000 byteに対し
+変更bin 4,065,177,600 byte（約80.1%減）。実際のUSB到着・出版時刻・欠落で転送量は変わる。
+これは転送対象データ量の計算であり、CUDA帯域や実行時間の測定ではない。
+
+Orin/対応CUDA環境で、ros2_wsから実行する:
+
+```bash
+colcon build --packages-select openeb_ros2 --cmake-args -DBUILD_TESTING=ON
+source install/setup.bash
+colcon test --packages-select openeb_ros2
+colcon test-result --verbose
+./build/openeb_ros2/histogram_bin_cuda_benchmark --iterations 1000 --events 100000
+```
+
+histogram_bin_cuda_testは実GPUでCPU出力との一致とpinned bufferの再利用、時刻/epoch更新を比較する。
+benchmarkは共通の合成CPU histogramを入力に、全Tensor H2Dと変更bin H2D＋GPU生成を比較する。
+100000 event/4ms、100回warmup、方式順を交互にし、mean/p50/p95/p99とpayload byteをJSONへ出す。
+計測はsnapshot準備開始からcudaStreamSynchronize完了まで。decode・USB・入力生成・D2H照合は除外。
+各処理を同期させる比較で、実運用の非同期overlapやTensorRT併走の速度保証ではない。
+MacではこのCUDA test/benchmarkは未実行、ROS/SDK/CUDA buildも未確認。
+本番評価では3つのprofileを同一条件で別runし、drop、sensor age、GPU負荷、TensorRT併走を確認する。
+既存診断snapshot_msは主にhostのenqueue時間であり、非同期GPU完了時間ではない。
+
+## Jetson以外のCUDAノートPCで比較
+
+ROS/OpenEB SDK不要の独立CMake buildとイベント量別3方式比較を
+[tools/cuda_benchmark](tools/cuda_benchmark/README.md)へ追加した。
+本番と同じCUDA backendを使い、全Tensor転送・変更bin転送＋GPU構成・GPUイベント集計を比較する。
+全イベント量でGPUが速いという前提は置かない。合成decode済みイベントの集計stageを測り、
+RAW decode・配列生成・USB・ROS・推論は除外する。常駐メモリとH2D payloadを区別する。
+ROS node/topic/parameterは追加なし。MacでCPU-onlyのbuild/testを確認、CUDA実行は未確認。
+
+### RAW decodeからTensor完成までをLinux NVIDIA PCで比較
+
+[単独CUDAテストの実RAW比較手順](tools/cuda_benchmark/README.md#3-実rawのdecodeからgpu-tensor完成まで比較する今回の主比較)
+を追加。`OPENEB_BENCH_RAW=ON`で公式event_camera_codecs headerを指定し、
+`event_tensor_raw_cuda_benchmark`と`raw_sweep.py`を使う。
+既存events／evt3_runs／evt3_runs_gpuへ同じRAW packet・窓終端を与え、
+decode、イベント列生成または直接集計、転送、Tensor生成、GPU完了待ちを含めて比較する。
+全Tensor要素の一致を毎窓確認し、p50/p95/p99、イベントレート別・窓別CSVを保存する。
+USB/ROS queue/publication/推論とframe間overlapは含まない。通常node/configは変更しない。
+MacのCPU照合とCUDA host側の構文検査まで実施。CUDA build・GPU速度はLinux実行で要確認。

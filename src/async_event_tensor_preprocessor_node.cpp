@@ -103,6 +103,11 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
   const rclcpp::NodeOptions & options)
 : Node("async_event_tensor_preprocessor", options)
 {
+  event_aggregation_ = declare_parameter<std::string>("event_aggregation", "events");
+  if (event_aggregation_ != "events" && event_aggregation_ != "evt3_runs" &&
+    event_aggregation_ != "evt3_runs_gpu") {
+    throw std::invalid_argument("event_aggregation must be events, evt3_runs, or evt3_runs_gpu");
+  }
   bins_ = declare_parameter<std::int64_t>("bins", 10);
   width_ = declare_parameter<std::int64_t>("width", 160);
   height_ = declare_parameter<std::int64_t>("height", 120);
@@ -218,11 +223,25 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
 
   cuda_stream_ = nvidia::isaac_ros::common::createCudaStream(
     "AsyncEventTensorPreprocessorNode");
-  cuda_backend_ = std::make_unique<EventTensorCudaBackend>(
-    static_cast<std::size_t>(width_), static_cast<std::size_t>(height_),
-    static_cast<std::size_t>(bins_), polarity_mode_ == "separate",
-    polarity_layout_ == "polarity_major", window_us_,
-    static_cast<std::size_t>(transfer_events), channel_mean_, channel_stddev_);
+  if (event_aggregation_ == "events") {
+    cuda_backend_ = std::make_unique<EventTensorCudaBackend>(
+      static_cast<std::size_t>(width_), static_cast<std::size_t>(height_),
+      static_cast<std::size_t>(bins_), polarity_mode_ == "separate",
+      polarity_layout_ == "polarity_major", window_us_,
+      static_cast<std::size_t>(transfer_events), channel_mean_, channel_stddev_);
+  } else {
+    direct_histogram_ = std::make_unique<Evt3RunsHistogram>(
+      width_, height_, bins_, window_us_, polarity_mode_ == "separate",
+      polarity_layout_ == "polarity_major", timestamp_backward_tolerance_us_);
+    if (event_aggregation_ == "evt3_runs_gpu") {
+      cuda_backend_ = std::make_unique<EventTensorCudaBackend>(
+        width_, height_, bins_, polarity_mode_ == "separate",
+        polarity_layout_ == "polarity_major", window_us_,
+        static_cast<std::size_t>(transfer_events), channel_mean_, channel_stddev_, false);
+    } else {
+      direct_snapshot_buffer_.resize(tensor_bytes_ / sizeof(float));
+    }
+  }
   decoder_factory_ = std::make_unique<DecoderFactory>();
 
   rclcpp::SubscriptionOptions subscription_options;
@@ -493,6 +512,11 @@ void AsyncEventTensorPreprocessorNode::decode_packet(PacketWork work)
     record_service();
     return;
   }
+  if (direct_histogram_) {
+    decode_direct_packet(std::move(work));
+    record_service();
+    return;
+  }
   decode_scratch_ = acquire_decode_buffer();
   decode_scratch_->clear();
   const auto decode_capacity_before =
@@ -619,8 +643,112 @@ bool AsyncEventTensorPreprocessorNode::pop_decoded(DecodedWork & work)
   return true;
 }
 
+void AsyncEventTensorPreprocessorNode::decode_direct_packet(PacketWork work)
+{
+  const auto started = std::chrono::steady_clock::now();
+  const auto & packet = *work.packet;
+  std::lock_guard<std::mutex> lock(direct_mutex_);
+  const auto before = direct_histogram_->statistics();
+  try {
+    if (packet.encoding != "evt3") throw std::invalid_argument("evt3_runs requires evt3 encoding");
+    if (packet.width != packet_width_ || packet.height != packet_height_) {
+      direct_histogram_->set_geometry(packet.width, packet.height);
+      packet_width_ = packet.width; packet_height_ = packet.height;
+      coordinate_lut_rebuilds_.fetch_add(1, std::memory_order_relaxed);
+    } else if (direct_has_sequence_ && static_cast<std::uint64_t>(packet.seq) != direct_sequence_+1) {
+      // Lost compressed words invalidate y/time/vector state. Never mix epochs.
+      direct_histogram_->reset_stream();
+    }
+    direct_sequence_ = packet.seq; direct_has_sequence_ = true;
+    direct_histogram_->feed(packet.events.data(), packet.events.size());
+    direct_frame_id_ = packet.header.frame_id;
+    if (direct_histogram_->ready() && direct_histogram_->statistics().accepted > before.accepted) {
+      const auto stamp = static_cast<std::int64_t>(packet.header.stamp.sec)*1000000000LL +
+        packet.header.stamp.nanosec;
+      direct_offset_ns_ = stamp - direct_histogram_->latest()*1000LL;
+    }
+  } catch (const std::exception & error) {
+    direct_histogram_->reset_stream();
+    decode_errors_.fetch_add(1, std::memory_order_relaxed);
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Direct EVT3 aggregation failed: %s", error.what());
+  }
+  const auto after = direct_histogram_->statistics();
+  const auto count = after.accepted-before.accepted;
+  out_of_bounds_events_.fetch_add(after.bounds-before.bounds, std::memory_order_relaxed);
+  out_of_order_events_.fetch_add(after.backward-before.backward, std::memory_order_relaxed);
+  timestamp_resets_.fetch_add(after.resets-before.resets, std::memory_order_relaxed);
+  dropped_out_of_order_events_.fetch_add(after.dropped-before.dropped, std::memory_order_relaxed);
+  update_max(backward_jump_max_us_, after.backward_max_us);
+  decoded_events_.fetch_add(count, std::memory_order_relaxed);
+  decoded_packets_.fetch_add(1, std::memory_order_relaxed);
+  const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now()-started).count());
+  decode_time_ns_.fetch_add(elapsed, std::memory_order_relaxed);
+  if (update_max(decode_time_max_ns_, elapsed)) {
+    decode_events_at_time_max_.store(count, std::memory_order_relaxed);
+  }
+  if (update_max(decode_packet_events_max_, count)) {
+    decode_time_at_events_max_ns_.store(elapsed, std::memory_order_relaxed);
+  }
+  direct_wakeup_.store(true, std::memory_order_release);
+  decoded_cv_.notify_one();
+}
+
+void AsyncEventTensorPreprocessorNode::direct_gpu_loop()
+{
+  const auto period = std::chrono::microseconds(output_period_us_);
+  while (!stopping_.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(direct_mutex_);
+      const auto epoch = direct_histogram_->epoch();
+      if (epoch != direct_snapshot_epoch_) {
+        if (direct_snapshot_epoch_ != 0) tensor_timing_->reset_epoch();
+        direct_snapshot_epoch_ = epoch;
+        next_window_end_us_ = 0; publish_schedule_origin_us_ = 0;
+        next_window_target_us_ = 0; last_header_timestamp_ns_ = 0;
+      }
+      if (next_window_end_us_ == 0 && direct_histogram_->ready()) {
+        const auto ready_end = direct_histogram_->latest_window_end();
+        if (ready_end > 0) {
+          publish_schedule_origin_us_ = ready_end;
+          const auto estimated = (now().nanoseconds()-direct_offset_ns_)/1000LL;
+          const auto target = std::max<std::int64_t>(ready_end, estimated);
+          next_window_target_us_ = ready_end + ((target-ready_end)/stride_us_)*stride_us_;
+          next_window_end_us_ = aligned_window_end(next_window_target_us_);
+          next_snapshot_at_ = std::chrono::steady_clock::now();
+        }
+      }
+    }
+    if (next_window_end_us_ > 0) {
+      const auto current = std::chrono::steady_clock::now();
+      if (current >= next_snapshot_at_) {
+        const auto late = std::chrono::duration_cast<std::chrono::microseconds>(current-next_snapshot_at_).count();
+        const auto due = late/output_period_us_+1;
+        if (due > 1) {
+          skipped_windows_.fetch_add(due-1, std::memory_order_relaxed);
+          deadline_misses_.fetch_add(due-1, std::memory_order_relaxed);
+        }
+        publish_snapshot(aligned_window_end(next_window_target_us_+(due-1)*output_period_us_),
+          next_snapshot_at_+period*(due-1));
+        next_window_target_us_ += due*output_period_us_;
+        next_window_end_us_ = aligned_window_end(next_window_target_us_);
+        next_snapshot_at_ += period*due;
+      }
+    }
+    std::unique_lock<std::mutex> lock(decoded_mutex_);
+    const auto wake = [this]() {
+        return stopping_.load(std::memory_order_acquire) ||
+               direct_wakeup_.exchange(false, std::memory_order_acq_rel);
+      };
+    if (next_window_end_us_ > 0) decoded_cv_.wait_until(lock, next_snapshot_at_, wake);
+    else decoded_cv_.wait_for(lock, period, wake);
+  }
+}
+
 void AsyncEventTensorPreprocessorNode::gpu_loop()
 {
+  if (direct_histogram_) {direct_gpu_loop(); return;}
   DecodedWork active;
   bool has_active = false;
   const auto period = std::chrono::microseconds(output_period_us_);
@@ -759,7 +887,7 @@ void AsyncEventTensorPreprocessorNode::apply_chunk(DecodedWork & work)
 void AsyncEventTensorPreprocessorNode::publish_snapshot(
   const std::int64_t window_end_us, const SteadyTime scheduled_at)
 {
-  if (!cuda_backend_->ready()) {
+  if (!direct_histogram_ && !cuda_backend_->ready()) {
     return;
   }
   const auto started = std::chrono::steady_clock::now();
@@ -775,8 +903,41 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
       static_cast<std::int32_t>(width_)};
     {
       auto write_handle = allocate_tensor(tensor, shape, *cuda_stream_);
-      cuda_backend_->snapshot(
-        reinterpret_cast<float *>(write_handle.get_ptr()), window_end_us, *cuda_stream_);
+      if (direct_histogram_) {
+        {
+          std::lock_guard<std::mutex> lock(direct_mutex_);
+          if (!direct_histogram_->ready() || direct_histogram_->epoch() != direct_snapshot_epoch_) {
+            return;  // The publisher worker will establish the new epoch schedule.
+          }
+          if (event_aggregation_ == "evt3_runs_gpu") {
+            direct_histogram_->take_dirty_bins(direct_bin_updates_);
+          } else {
+            direct_histogram_->snapshot(direct_snapshot_buffer_.data(), window_end_us,
+              channel_mean_, channel_stddev_);
+          }
+          frame_id_ = direct_frame_id_;
+          sensor_to_ros_offset_ns_ = direct_offset_ns_;
+          last_applied_event_ros_ns_.store(
+            direct_histogram_->latest()*1000LL + direct_offset_ns_, std::memory_order_relaxed);
+          applied_event_version_ = direct_histogram_->statistics().accepted;
+          events_since_snapshot_ = applied_event_version_ - snapshot_event_version_;
+        }
+        if (event_aggregation_ == "evt3_runs_gpu") {
+          cuda_backend_->update_bins(direct_bin_updates_, *cuda_stream_);
+          cuda_backend_->snapshot(reinterpret_cast<float *>(write_handle.get_ptr()),
+            window_end_us, *cuda_stream_);
+        } else {
+          // The CPU-only aggregation mode still uploads a complete snapshot.
+          auto result = cudaMemcpyAsync(write_handle.get_ptr(), direct_snapshot_buffer_.data(),
+            tensor_bytes_, cudaMemcpyHostToDevice, *cuda_stream_);
+          if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+          result = cudaStreamSynchronize(*cuda_stream_);
+          if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+        }
+      } else {
+        cuda_backend_->snapshot(
+          reinterpret_cast<float *>(write_handle.get_ptr()), window_end_us, *cuda_stream_);
+      }
     }
     // Timestamp the tensor with the freshest event actually represented in it.
     // The logical fixed-rate window end can be ahead of the newest received
@@ -833,6 +994,10 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
       update_max(state_age_max_ns_, age_ns);
     }
   } catch (const std::exception & error) {
+    if (event_aggregation_ == "evt3_runs_gpu") {
+      std::lock_guard<std::mutex> lock(direct_mutex_);
+      direct_histogram_->mark_all_dirty();
+    }
     const std::string message = error.what();
     if (message.find("exhaust") != std::string::npos ||
       message.find("pool") != std::string::npos)
@@ -1127,6 +1292,9 @@ void AsyncEventTensorPreprocessorNode::publish_diagnostics()
     "event queue, timestamp, CUDA pool, or fixed-rate deadline issue detected";
   status.values = {
     value("pipeline_mode", "single_node_async"),
+    value("event_aggregation", event_aggregation_),
+    value("tensor_upload", event_aggregation_ == "evt3_runs_gpu" ? "dirty_cpu_bins" :
+      (direct_histogram_ ? "full_cpu_snapshot" : "gpu_ring_snapshot")),
     number("packets_received_per_s", packets / elapsed_s),
     number(
       "packets_received_total",

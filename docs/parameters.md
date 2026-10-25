@@ -123,6 +123,7 @@ config/tensor_*.yamlはdirect pipeline向けのsubscribe_packets=false。単体c
 
 | 名前 | 基準値 | 意味 |
 |---|---|---|
+| `event_aggregation` | `"events"` | 起動時固定。eventsは従来のイベント配列＋GPU集計、evt3_runsはCPU直接集計＋全Tensor転送、evt3_runs_gpuはCPU直接集計＋変更bin転送＋GPU Tensor生成。cuda_asyncのみ。 |
 | `bins` | `10` | 時間bin数。 |
 | `width` | `160` | 出力tensor幅[pixel]。 |
 | `height` | `120` | 出力tensor高さ[pixel]。 |

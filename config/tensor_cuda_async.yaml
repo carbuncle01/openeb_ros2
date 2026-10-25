@@ -1,5 +1,6 @@
 /**/event_tensor:
   ros__parameters:
+    event_aggregation: "events"
     bins: 10
     width: 160
     height: 120

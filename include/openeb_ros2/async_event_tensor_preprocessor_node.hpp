@@ -22,6 +22,7 @@
 #include "event_camera_msgs/msg/event_packet.hpp"
 #include "isaac_ros_common/cuda_stream.hpp"
 #include "openeb_ros2/tensor_output.hpp"
+#include "openeb_ros2/evt3_runs_histogram.hpp"
 #include "isaac_ros_tensor_msgs/msg/tensor_list.hpp"
 #include "openeb_ros2/event_tensor_cuda_backend.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -80,6 +81,8 @@ private:
   void on_packet(EventPacket::UniquePtr packet);
   void decode_loop();
   void gpu_loop();
+  void direct_gpu_loop();
+  void decode_direct_packet(PacketWork work);
   void decode_packet(PacketWork work);
   std::unique_ptr<std::vector<CudaEvent>> acquire_decode_buffer();
   void release_decode_buffer(std::unique_ptr<std::vector<CudaEvent>> buffer);
@@ -119,6 +122,16 @@ private:
   bool publish_empty_{true};
   bool debug_{false};
 
+  std::string event_aggregation_{"events"};
+  std::unique_ptr<Evt3RunsHistogram> direct_histogram_;
+  std::mutex direct_mutex_;
+  std::atomic<bool> direct_wakeup_{false};
+  bool direct_has_sequence_{false};
+  std::uint64_t direct_sequence_{0}, direct_snapshot_epoch_{0};
+  std::string direct_frame_id_;
+  std::int64_t direct_offset_ns_{0};
+  std::vector<float> direct_snapshot_buffer_;
+  HistogramBinUpdates direct_bin_updates_;
   std::unique_ptr<DecoderFactory> decoder_factory_;
   std::unique_ptr<EventTensorCudaBackend> cuda_backend_;
   nvidia::isaac_ros::common::CudaStreamPtr cuda_stream_;

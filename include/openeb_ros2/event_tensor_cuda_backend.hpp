@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include "openeb_ros2/histogram_bin_updates.hpp"
 
 namespace openeb_ros2
 {
@@ -28,7 +29,8 @@ public:
     bool separate_polarities, bool polarity_major,
     std::int64_t window_us, std::size_t batch_capacity,
     const std::vector<double> & channel_mean,
-    const std::vector<double> & channel_stddev);
+    const std::vector<double> & channel_stddev,
+    bool enable_event_staging = true);
   ~EventTensorCudaBackend();
 
   EventTensorCudaBackend(const EventTensorCudaBackend &) = delete;
@@ -37,6 +39,9 @@ public:
   void reset(cudaStream_t stream);
   void update(const std::vector<CudaEvent> & events, cudaStream_t stream);
   void update(const CudaEvent * events, std::size_t count, cudaStream_t stream);
+  // Copies absolute dirty CPU bins through owned pinned buffers. Calls must
+  // use one stream; do not mix event updates and bin updates without reset().
+  void update_bins(const HistogramBinUpdates & updates, cudaStream_t stream);
   void snapshot(float * output, std::int64_t window_end_us, cudaStream_t stream);
 
   bool ready() const;

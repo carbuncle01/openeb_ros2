@@ -1,4 +1,5 @@
 #include "openeb_ros2/event_tensor_cuda_backend.hpp"
+#include "openeb_ros2/evt3_runs_histogram.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -61,6 +62,10 @@ int main()
       {2000, 3, 2, 1, {0, 0, 0}},
       {3000, 0, 0, 0, {0, 0, 0}},
   };
+  openeb_ros2::Evt3RunsHistogram direct(kWidth,kHeight,kBins,2000,true,true);
+  direct.set_geometry(kWidth,kHeight);
+  for (const auto& e : events) direct.event(e.timestamp_us,e.x,e.y,e.polarity);
+  std::vector<float> cpu_output(kElements);
   // The asynchronous preprocessor sends bounded slices of a decoded packet.
   backend.update(events.data(), events.size(), stream);
 
@@ -72,6 +77,8 @@ int main()
   {
     return 1;
   }
+  direct.snapshot(cpu_output.data(),3000);
+  for(std::size_t i=0;i<kElements;++i) ok &= output[i]==cpu_output[i];
   ok &= expect_value(output, 0, 1U * kWidth + 1U, 1.0F);
   ok &= expect_value(output, 1, 2U * kWidth + 3U, 1.0F);
   ok &= expect_value(output, 2, 1U * kWidth + 2U, 1.0F);
@@ -86,6 +93,8 @@ int main()
   {
     return 1;
   }
+  direct.snapshot(cpu_output.data(),5000);
+  for(std::size_t i=0;i<kElements;++i) ok &= output[i]==cpu_output[i];
   ok &= expect_value(output, 0, 0U, 0.0F);
   ok &= expect_value(output, 1, 0U, 0.0F);
   ok &= expect_value(output, 2, 0U, 1.0F);

@@ -75,3 +75,20 @@ RAWの0秒へ直接足さない。HALのget_timestamp_shift()でファイルご�
 `ros_ns=(raw_relative_us+raw_sensor_shift_us)*1000+sensor_to_ros_offset_ns`で対応付ける。
 RAW splitごとにshiftを取得し、timestamp reset/rolloverはepoch別に扱う。
 SDK実装: https://github.com/prophesee-ai/openeb/blob/5.2.0/hal/cpp/include/metavision/hal/facilities/i_events_stream_decoder.h
+
+## cuda_async opt-in CPU直接集計（2026-10-25）
+
+`event_aggregation=events`を既定として維持。`evt3_runs`では所有RAW packetをdecode workerで
+直接CPU binへ集計し、snapshot workerが完成TensorをH2Dする。イベント配列を介さない。
+両workerは同じringをmutexで保護し、転送用snapshotの寿命はCUDA完了まで維持する。
+seq不連続ではdecoder/ringをresetし、異なる時刻epochのbinを混在させない。
+更新binだけのGPU転送や取得SDK bufferのzero-copyはこの方式の契約に含めない。
+時刻処理はevent_camera_codecs互換を試験し、同じsensor windowでTensorを比較する。
+
+## evt3_runs_gpu（2026-10-25）
+
+直接集計の追加選択肢。CPUの2-window ringからdirty slotの絶対値を所有bufferへ取得し、
+固定pinned staging経由でGPU ringへ上書きする。epoch/reset/clearと再送でcountを重複させない。
+GPUは既存snapshot kernelを使う。既定eventsとCPU版evt3_runsの意味は維持する。
+更新buffer、pinned staging、GPU ringはそれぞれの寿命を持ち、CUDA eventで再利用を保護する。
+失敗時は現在の全CPU slotを再送する。小さいCD時刻逆行の破棄閾値は既存parameterを使う。

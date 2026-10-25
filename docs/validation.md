@@ -51,3 +51,64 @@ GPU tensor payloadへの追加購読なしのrunも比較する。
 Tensor timing: portable ROS-stub serialization/JSON/integer mapping/epoch/sequence checks passed.
 check_configuration.py passed. No actual ROS publication, SDK RAW shift extraction, GPU or sync validation.
 Run test/check_timing.py to repeat the portable check; stubs do not establish ROS integration.
+
+## evt3_runs opt-in追加（2026-10-25）
+
+- Evt3RunsHistogram単体: 境界、sum pooling、signed/separate、polarity/time layout、
+  正規化、空窓、保持期限、範囲外、局所逆行、reset、奇数byte拒否を確認。
+- upstream event_camera_codecsの公式ヘッダーを一時取得して実際にコンパイルした
+  evt3_runs_codec_equivalence_testが成功。初期HIGH/LOW分割、ベクトル、trigger、
+  padding、24bit rollover、2/14/65536 byte packet境界、4つのpolarity/layout条件を照合。
+- 全RAW（53.125443秒、1,345,943,605 CD）の13,272窓を、公式decoder→scalar histogramと
+  evt3_runsで照合。全FP32 Tensorをmemcmpで比較し一致。digest=16274568228255728515。
+  scalar histogram側は同じring/snapshot coreを使うため、この照合はdecoder/run集計の
+  差分を検出する試験。ringの独立した期待値は単体試験、GPU kernelとの一致は下記試験。
+- 6 profileのparameter網羅、launch構文、既存TensorTiming stub試験が成功。
+- 既存event_tensor_cuda_backend_testにCPU直接集計との全要素比較を追加。
+  CUDAがないMacでは実行していない。targetでcolcon testを実施すること。
+
+取得したreferenceはupstream master。対象Jetsonに導入済みcodecのversionは未確認。
+colcon testはその環境のinstalled event_camera_codecsを使って互換性を再確認する。
+MacにはROS/colcon/nvccがなく、node全体のROS/SDK/CUDA build、live USB、
+TensorRT結合、Orin throughput/deadline、実際の出版header/epochは未検証。
+算法の一致は同一sensor windowの条件であり、wall timerで出版する回数や
+queue欠落・resetの有無が異なる実行同士で同じTensor系列になるという保証ではない。
+
+対象環境での確認:
+1. 通常通りbuild/sourceしてcolcon test --packages-select openeb_ros2。
+2. tensor_cuda_async_runs.yamlを指定して起動し、診断event_aggregation=evt3_runs、
+   tensor_upload=full_cpu_snapshotを確認。通常profileはeventsのまま。
+3. 同じRAWをbuild/openeb_ros2/evt3_runs_codec_equivalence_test --rawで再照合。
+4. event stream/epoch/windowで比較し、TensorRT併走時のqueue drop、decode busy、
+   snapshot期限、CPU→GPU転送を測定する。試験は制御出力を伴わない条件で開始する。
+
+## evt3_runs_gpu（2026-10-25）
+
+Macでhistogram_bin_updates_test、evt3_runs_histogram_test、公式codecとの合成比較が成功。
+全RAWのCPU参照・直接集計・dirty-bin再構成CPU模擬を比較し、13,272 Tensorがmemcmp/全要素一致。
+有効event 1,345,943,605、digest 16274568228255728515。bin転送対象4,065,177,600 byteに対して
+全Tensor転送対象20,385,792,000 byte。USB/実GPU転送帯域の測定ではない。
+7 profileの設定網羅、launch構文、TensorTimingのstub試験を確認。
+CUDA用histogram_bin_cuda_testとhistogram_bin_cuda_benchmarkを追加したが、Macでは未実行。
+GPU版のROS/SDK/CUDA build、USB camera、GPU一致、推論併走・Orin性能は未確認。
+CPU模擬の成功をCUDA kernel・転送寿命の実GPU検証と混同しない。
+
+## ノートPC用独立ベンチマーク（2026-10-25）
+
+tools/cuda_benchmarkからROS/SDK依存なしに本番CUDA backendをbuildできる構成を追加。
+CPU-only build、CPU histogram/更新bin、runnerのschema/失敗値・dry-run検証をMacで確認。
+イベント量0.25/2.5/25/50 M events/s相当とuniform/hotspotを比較するrunnerを追加。
+集計stage内のCPU集計・転送・GPU完了までを比較し、RAW decodeやevent配列生成は除外する。
+CUDA compiler、CUDA build、GPUでの一致・速度はこのMacでは未検証。
+
+## RAW-to-CUDA比較の準備
+
+`tools/cuda_benchmark`にopt-in `OPENEB_BENCH_RAW`を追加。
+公式codecの外部headerを明示し、production CUDA backendと直接集計coreを使用。
+RAW読込み・indexは計測外、同一packetを既存events/new full/new binsへ入力。
+decode採用数・drop数・clock・GPU Tensor全要素を比較し、GPU completion込みのwall timeを保存。
+異なるdecoderのOOB統計は直接比較しない（公式decoderはcallback前にOOBを除外）。
+CPU testで14/64/65536byte境界、vector encoding、OOB、小時刻逆転、ringとdirty mirrorを検証。
+手元RAW冒頭16MiBもCPU一致。portable CTestとrunner検査、host C++構文検査を実施。
+このMacではnvcc/GPUを使っていない。CUDA compile、GPU一致と高速化は未確認。
+通常async nodeのworker scheduling/ROS/USB/実車の性能保証とは分離する。
