@@ -92,3 +92,33 @@ seq不連続ではdecoder/ringをresetし、異なる時刻epochのbinを混在�
 GPUは既存snapshot kernelを使う。既定eventsとCPU版evt3_runsの意味は維持する。
 更新buffer、pinned staging、GPU ringはそれぞれの寿命を持ち、CUDA eventで再利用を保護する。
 失敗時は現在の全CPU slotを再送する。小さいCD時刻逆行の破棄閾値は既存parameterを使う。
+
+## Borrowed histogram viewによるCPUコピー削減の評価
+
+新APIはCPU ringのdirty planeを借用し、owned pinned stagingへ直接退避する。
+evt3_runs_gpu_directは独立benchmarkで比較後、ROSのstartup選択にも追加。既定eventsは維持する。
+借用期間はpeekからupdate_bins_direct完了まで。外部serializationでhistogramの変更を禁止する。
+GPU転送中のCPU ring参照は認めず、CUDA eventでpinned slotを保護し、成功時のみdirtyをackする。
+GPU転送量・Tensor順序・dtype・正規化・窓定義は従来と同一。障害後は全dirty再送で復旧する。
+ROSではpeekからupdate_bins_directまで同じmutexを保持し、成功後にackする。liveのmutex保持時間は実機で評価する。
+
+## 圧縮runをGPUで直接histogramへ加算する評価経路
+
+CPUはEVT3状態と座標範囲・時刻逆転を検査し、同時刻・YのADDR_X runまたはvector wordを記述する。
+pixel histogramは作らず、圧縮RAW＋24byte descriptorをowned pinned/device stagingへコピーする。
+GPUは展開済みイベント配列を作らずrolling ringへ直接atomic加算し、既存snapshot kernelを使う。
+stagingは2 slot・事前確保・CUDA eventで保護する。入力CPU bufferの寿命はupdate呼出しの終了まで。
+GPU上のring保持範囲、half-open窓、座標floor、極性順、normalizationは現方式と同一。
+新旧mode混在には明示resetが必要。大きな逆転はscannerのepochを更新し、GPU ringを初期化する。
+独立benchmarkのevt3_runs_grouped_gpuで一致と性能を確認後、ROSのstartup選択にも追加。
+
+
+## ROS grouped workerと選択override
+
+受信callbackは有界RAW queueへの所有権移譲のみとし、grouped専用workerがparser・CUDA・snapshot scheduleを所有する。
+CPU run scannerはpacket/run上限を持ち、固定容量の2 pinned/device slotを起動時確保する。
+packetはupdate_grouped_raw完了まで保持し、以後はbackendが所有するpinnedコピーとCUDA eventで寿命を守る。
+sequence gap/reorder、queue overflow、stale、上限、geometry、decode/CUDA errorで履歴を破棄して再取得する。
+古い履歴と新しいepochを混在させず、4ms以内の時刻逆転はevent dropとして継続する。
+CLI/TUIのevs_aggregationはselectorのevent_aggregationへ渡し、backend=cuda_async時だけchildへ明示overrideする。
+shapeやnormalizationをprofile選択で置換せず、モデル由来Tensor YAMLとの併用を保持する。

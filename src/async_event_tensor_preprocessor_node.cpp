@@ -105,8 +105,9 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
 {
   event_aggregation_ = declare_parameter<std::string>("event_aggregation", "events");
   if (event_aggregation_ != "events" && event_aggregation_ != "evt3_runs" &&
-    event_aggregation_ != "evt3_runs_gpu") {
-    throw std::invalid_argument("event_aggregation must be events, evt3_runs, or evt3_runs_gpu");
+    event_aggregation_ != "evt3_runs_gpu" && event_aggregation_ != "evt3_runs_gpu_direct" &&
+    event_aggregation_ != "evt3_runs_grouped_gpu") {
+    throw std::invalid_argument("event_aggregation must be events, evt3_runs, evt3_runs_gpu, evt3_runs_gpu_direct, or evt3_runs_grouped_gpu");
   }
   bins_ = declare_parameter<std::int64_t>("bins", 10);
   width_ = declare_parameter<std::int64_t>("width", 160);
@@ -129,6 +130,8 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
   deadline_ms_ = declare_parameter<double>("deadline_ms", 4.0);
   timestamp_backward_tolerance_us_ = declare_parameter<std::int64_t>(
     "timestamp_backward_tolerance_us", 4000);
+  const auto grouped_max_packet_bytes = declare_parameter<std::int64_t>("grouped_max_packet_bytes", 1048576);
+  const auto grouped_max_runs = declare_parameter<std::int64_t>("grouped_max_runs", 65536);
   const auto transfer_events =
     declare_parameter<std::int64_t>("cuda_events_per_transfer", 8192);
   const auto gpu_chunk_events =
@@ -166,6 +169,9 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
             "the asynchronous CUDA preprocessor currently supports temporal_interpolation=none");
   }
   if (
+    grouped_max_packet_bytes < 2 || grouped_max_packet_bytes % 2 ||
+    grouped_max_packet_bytes > 16777216 || grouped_max_runs <= 0 ||
+    grouped_max_runs > grouped_max_packet_bytes/2 ||
     transfer_events <= 0 || gpu_chunk_events <= 0 || packet_queue_capacity <= 0 ||
     decoded_queue_capacity <= 0 || subscription_depth <= 0 || publisher_depth <= 0 ||
     decode_buffer_pool_capacity <= 0 || decode_buffer_pool_max_events <= 0 ||
@@ -192,6 +198,8 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
     throw std::invalid_argument("output_rate_hz cannot exceed the event representation stride rate");
   }
 
+  grouped_max_packet_bytes_ = static_cast<std::size_t>(grouped_max_packet_bytes);
+  grouped_max_runs_ = static_cast<std::size_t>(grouped_max_runs);
   packet_queue_capacity_ = static_cast<std::size_t>(packet_queue_capacity);
   decoded_queue_capacity_ = static_cast<std::size_t>(decoded_queue_capacity);
   gpu_chunk_events_ = static_cast<std::size_t>(gpu_chunk_events);
@@ -229,11 +237,19 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
       static_cast<std::size_t>(bins_), polarity_mode_ == "separate",
       polarity_layout_ == "polarity_major", window_us_,
       static_cast<std::size_t>(transfer_events), channel_mean_, channel_stddev_);
+  } else if (event_aggregation_ == "evt3_runs_grouped_gpu") {
+    grouped_stream_ = std::make_unique<Evt3GroupedStream>(width_, height_, bins_, window_us_,
+      polarity_mode_ == "separate", polarity_layout_ == "polarity_major",
+      timestamp_backward_tolerance_us_, grouped_max_packet_bytes_, grouped_max_runs_);
+    cuda_backend_ = std::make_unique<EventTensorCudaBackend>(width_, height_, bins_,
+      polarity_mode_ == "separate", polarity_layout_ == "polarity_major", window_us_,
+      static_cast<std::size_t>(transfer_events), channel_mean_, channel_stddev_, false);
+    cuda_backend_->reserve_grouped_raw(grouped_max_packet_bytes_, grouped_max_runs_);
   } else {
     direct_histogram_ = std::make_unique<Evt3RunsHistogram>(
       width_, height_, bins_, window_us_, polarity_mode_ == "separate",
       polarity_layout_ == "polarity_major", timestamp_backward_tolerance_us_);
-    if (event_aggregation_ == "evt3_runs_gpu") {
+    if (event_aggregation_ == "evt3_runs_gpu" || event_aggregation_ == "evt3_runs_gpu_direct") {
       cuda_backend_ = std::make_unique<EventTensorCudaBackend>(
         width_, height_, bins_, polarity_mode_ == "separate",
         polarity_layout_ == "polarity_major", window_us_,
@@ -272,7 +288,7 @@ AsyncEventTensorPreprocessorNode::AsyncEventTensorPreprocessorNode(
       std::bind(&AsyncEventTensorPreprocessorNode::publish_diagnostics, this));
   }
 
-  decode_thread_ = std::thread(&AsyncEventTensorPreprocessorNode::decode_loop, this);
+  if (!grouped_stream_) decode_thread_ = std::thread(&AsyncEventTensorPreprocessorNode::decode_loop, this);
   gpu_thread_ = std::thread(&AsyncEventTensorPreprocessorNode::gpu_loop, this);
   RCLCPP_INFO(
     get_logger(),
@@ -349,6 +365,12 @@ void AsyncEventTensorPreprocessorNode::on_packet(EventPacket::UniquePtr packet)
       packet_interarrival_over_output_period_.fetch_add(1, std::memory_order_relaxed);
     }
   }
+  if (grouped_stream_ && packet->events.size() > grouped_max_packet_bytes_) {
+    grouped_limit_drops_.fetch_add(1, std::memory_order_relaxed);
+    dropped_packet_queue_packets_.fetch_add(1, std::memory_order_relaxed);
+    dropped_packet_queue_bytes_.fetch_add(packet->events.size(), std::memory_order_relaxed);
+    grouped_reset_pending_.store(true, std::memory_order_release);packet_cv_.notify_one();return;
+  }
   {
     std::lock_guard<std::mutex> lock(packet_mutex_);
     if (packet_queue_.size() >= packet_queue_capacity_) {
@@ -357,6 +379,7 @@ void AsyncEventTensorPreprocessorNode::on_packet(EventPacket::UniquePtr packet)
         dropped.packet ? dropped.packet->events.size() : 0U, std::memory_order_relaxed);
       dropped_packet_queue_packets_.fetch_add(1, std::memory_order_relaxed);
       packet_queue_.pop_front();
+      if (grouped_stream_) grouped_reset_pending_.store(true, std::memory_order_release);
     }
     packet_queue_.push_back(PacketWork{std::move(packet), started});
     packet_queue_depth_.store(packet_queue_.size(), std::memory_order_relaxed);
@@ -507,11 +530,13 @@ void AsyncEventTensorPreprocessorNode::decode_packet(PacketWork work)
     return;
   }
   if (milliseconds(wait_ns) > max_queue_age_ms_) {
+    if (grouped_stream_) reset_grouped_pipeline();
     stale_packet_queue_packets_.fetch_add(1, std::memory_order_relaxed);
     dropped_packet_queue_bytes_.fetch_add(packet->events.size(), std::memory_order_relaxed);
     record_service();
     return;
   }
+  if (grouped_stream_) {decode_grouped_packet(std::move(work));record_service();return;}
   if (direct_histogram_) {
     decode_direct_packet(std::move(work));
     record_service();
@@ -695,6 +720,138 @@ void AsyncEventTensorPreprocessorNode::decode_direct_packet(PacketWork work)
   decoded_cv_.notify_one();
 }
 
+void AsyncEventTensorPreprocessorNode::reset_grouped_output()
+{
+  // Only the grouped private worker calls CUDA or modifies the schedule.
+  next_window_end_us_ = 0; next_window_target_us_ = 0; publish_schedule_origin_us_ = 0;
+  last_header_timestamp_ns_ = 0; sensor_to_ros_offset_ns_ = 0;
+  applied_event_version_ = 0; snapshot_event_version_ = 0; events_since_snapshot_ = 0;
+  last_applied_event_ros_ns_.store(0, std::memory_order_relaxed);
+  tensor_timing_->reset_epoch();
+  cuda_backend_->reset(*cuda_stream_);
+}
+
+void AsyncEventTensorPreprocessorNode::reset_grouped_pipeline()
+{
+  grouped_stream_->reset();
+  try {reset_grouped_output();}
+  catch (const std::exception & error) {
+    publish_errors_.fetch_add(1, std::memory_order_relaxed);
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "Grouped CUDA reset failed: %s", error.what());
+  }
+}
+
+void AsyncEventTensorPreprocessorNode::decode_grouped_packet(PacketWork work)
+{
+  const auto started = std::chrono::steady_clock::now();
+  const auto before = grouped_stream_->statistics();
+  const auto & packet = *work.packet; bool scan_recorded = false;
+  const auto record_scan = [this, before, started, &scan_recorded]() {
+      if (scan_recorded) return;
+      scan_recorded = true;
+      const auto after = grouped_stream_->statistics();
+      const auto count = after.accepted-before.accepted;
+      decoded_events_.fetch_add(count, std::memory_order_relaxed);
+      decoded_packets_.fetch_add(1, std::memory_order_relaxed);
+      out_of_bounds_events_.fetch_add(after.bounds-before.bounds, std::memory_order_relaxed);
+      out_of_order_events_.fetch_add(after.backward-before.backward, std::memory_order_relaxed);
+      dropped_out_of_order_events_.fetch_add(after.dropped-before.dropped, std::memory_order_relaxed);
+      timestamp_resets_.fetch_add(after.resets-before.resets, std::memory_order_relaxed);
+      update_max(backward_jump_max_us_, after.backward_max_us);
+      const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-started).count());
+      decode_time_ns_.fetch_add(ns, std::memory_order_relaxed);
+      if (update_max(decode_time_max_ns_, ns)) decode_events_at_time_max_.store(count, std::memory_order_relaxed);
+      if (update_max(decode_packet_events_max_, count)) decode_time_at_events_max_ns_.store(ns, std::memory_order_relaxed);
+    };
+  try {
+    if (packet.encoding != "evt3") throw std::invalid_argument("evt3_runs_grouped_gpu requires evt3 encoding");
+    const auto & batch = grouped_stream_->ingest(packet.events.data(), packet.events.size(),
+      packet.width, packet.height, packet.seq);
+    record_scan();
+    if (grouped_stream_->geometry_changed()) coordinate_lut_rebuilds_.fetch_add(1, std::memory_order_relaxed);
+    if (grouped_stream_->reset_before()) reset_grouped_output();
+    if (!batch.ready || batch.runs.empty()) return;
+    const auto gpu_started = std::chrono::steady_clock::now();
+    cuda_backend_->update_grouped_raw(batch, packet.events.data(), packet.events.size(), *cuda_stream_);
+    const auto finished = std::chrono::steady_clock::now();
+    const auto gpu_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished-gpu_started).count());
+    gpu_updates_.fetch_add(1, std::memory_order_relaxed);
+    gpu_events_.fetch_add(batch.accepted_events, std::memory_order_relaxed);
+    gpu_update_time_ns_.fetch_add(gpu_ns, std::memory_order_relaxed);update_max(gpu_update_time_max_ns_, gpu_ns);
+    grouped_raw_bytes_.fetch_add(packet.events.size(), std::memory_order_relaxed);
+    grouped_descriptor_bytes_.fetch_add(batch.runs.size()*sizeof(Evt3Run), std::memory_order_relaxed);
+    grouped_run_count_.fetch_add(batch.runs.size(), std::memory_order_relaxed);
+    applied_event_version_ += batch.accepted_events; events_since_snapshot_ += batch.accepted_events;
+    frame_id_ = packet.header.frame_id;
+    const auto stamp = static_cast<std::int64_t>(packet.header.stamp.sec)*1000000000LL + packet.header.stamp.nanosec;
+    sensor_to_ros_offset_ns_ = stamp-batch.metadata.latest_us*1000LL;
+    last_applied_event_ros_ns_.store(stamp, std::memory_order_relaxed);
+    if (next_window_end_us_ == 0) {
+      const auto ready_end = cuda_backend_->latest_window_end_us();
+      if (ready_end > 0) {
+        publish_schedule_origin_us_ = ready_end;
+        const auto estimated = (now().nanoseconds()-sensor_to_ros_offset_ns_)/1000LL;
+        const auto target = std::max<std::int64_t>(ready_end, estimated);
+        next_window_target_us_ = ready_end+((target-ready_end)/stride_us_)*stride_us_;
+        next_window_end_us_ = aligned_window_end(next_window_target_us_);
+        next_snapshot_at_ = finished;
+      }
+    }
+    // packet and scanner descriptors may now be reused: CUDA only sees owned
+    // pinned copies protected by the grouped backend's two completion events.
+  } catch (const std::exception & error) {
+    record_scan();decode_errors_.fetch_add(1, std::memory_order_relaxed);
+    if (dynamic_cast<const std::length_error *>(&error)) grouped_limit_drops_.fetch_add(1, std::memory_order_relaxed);
+    reset_grouped_pipeline();
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "Grouped EVT3 processing failed: %s", error.what());
+  }
+}
+
+void AsyncEventTensorPreprocessorNode::grouped_gpu_loop()
+{
+  const auto period = std::chrono::microseconds(output_period_us_);
+  while (!stopping_.load(std::memory_order_acquire)) {
+    if (grouped_reset_pending_.exchange(false, std::memory_order_acq_rel)) {
+      // Queue overflow/oversize invalidates compressed stream continuity.
+      // Drop the pending RAW prefix and restart acquisition; never publish a
+      // histogram silently missing events from a dropped packet.
+      {
+        std::lock_guard<std::mutex> lock(packet_mutex_);
+        for (const auto & work : packet_queue_) {
+          dropped_packet_queue_packets_.fetch_add(1, std::memory_order_relaxed);
+          dropped_packet_queue_bytes_.fetch_add(work.packet->events.size(), std::memory_order_relaxed);
+        }
+        packet_queue_.clear();packet_queue_depth_.store(0, std::memory_order_relaxed);
+      }
+      reset_grouped_pipeline();
+    }
+    const auto current = std::chrono::steady_clock::now();
+    if (next_window_end_us_ > 0 && current >= next_snapshot_at_) {
+      const auto late = std::chrono::duration_cast<std::chrono::microseconds>(current-next_snapshot_at_).count();
+      const auto due = late/output_period_us_+1;
+      if (due > 1) {skipped_windows_.fetch_add(due-1, std::memory_order_relaxed);deadline_misses_.fetch_add(due-1, std::memory_order_relaxed);}
+      publish_snapshot(aligned_window_end(next_window_target_us_+(due-1)*output_period_us_), next_snapshot_at_+period*(due-1));
+      next_window_target_us_ += due*output_period_us_;next_window_end_us_ = aligned_window_end(next_window_target_us_);
+      next_snapshot_at_ += period*due;continue;
+    }
+    PacketWork work;
+    {
+      std::unique_lock<std::mutex> lock(packet_mutex_);
+      const auto wake = [this]() {return stopping_.load(std::memory_order_acquire)||grouped_reset_pending_.load(std::memory_order_acquire)||!packet_queue_.empty();};
+      if (packet_queue_.empty()) {
+        if (next_window_end_us_ > 0) packet_cv_.wait_until(lock, next_snapshot_at_, wake);
+        else packet_cv_.wait(lock, wake);
+      }
+      if (stopping_.load(std::memory_order_acquire)) break;
+      if (grouped_reset_pending_.load(std::memory_order_acquire)||packet_queue_.empty()) continue;
+      work = std::move(packet_queue_.front());packet_queue_.pop_front();
+      packet_queue_depth_.store(packet_queue_.size(), std::memory_order_relaxed);
+    }
+    decode_packet(std::move(work));
+  }
+}
+
 void AsyncEventTensorPreprocessorNode::direct_gpu_loop()
 {
   const auto period = std::chrono::microseconds(output_period_us_);
@@ -748,6 +905,7 @@ void AsyncEventTensorPreprocessorNode::direct_gpu_loop()
 
 void AsyncEventTensorPreprocessorNode::gpu_loop()
 {
+  if (grouped_stream_) {grouped_gpu_loop();return;}
   if (direct_histogram_) {direct_gpu_loop(); return;}
   DecodedWork active;
   bool has_active = false;
@@ -887,6 +1045,7 @@ void AsyncEventTensorPreprocessorNode::apply_chunk(DecodedWork & work)
 void AsyncEventTensorPreprocessorNode::publish_snapshot(
   const std::int64_t window_end_us, const SteadyTime scheduled_at)
 {
+  if (grouped_stream_ && grouped_reset_pending_.load(std::memory_order_acquire)) return;
   if (!direct_histogram_ && !cuda_backend_->ready()) {
     return;
   }
@@ -909,7 +1068,11 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
           if (!direct_histogram_->ready() || direct_histogram_->epoch() != direct_snapshot_epoch_) {
             return;  // The publisher worker will establish the new epoch schedule.
           }
-          if (event_aggregation_ == "evt3_runs_gpu") {
+          if (event_aggregation_ == "evt3_runs_gpu_direct") {
+            direct_histogram_->peek_dirty_bins(direct_bin_view_);
+            cuda_backend_->update_bins_direct(direct_bin_view_, *cuda_stream_);
+            direct_histogram_->acknowledge_dirty_bins();
+          } else if (event_aggregation_ == "evt3_runs_gpu") {
             direct_histogram_->take_dirty_bins(direct_bin_updates_);
           } else {
             direct_histogram_->snapshot(direct_snapshot_buffer_.data(), window_end_us,
@@ -922,7 +1085,9 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
           applied_event_version_ = direct_histogram_->statistics().accepted;
           events_since_snapshot_ = applied_event_version_ - snapshot_event_version_;
         }
-        if (event_aggregation_ == "evt3_runs_gpu") {
+        if (event_aggregation_ == "evt3_runs_gpu_direct") {
+          cuda_backend_->snapshot(reinterpret_cast<float *>(write_handle.get_ptr()), window_end_us, *cuda_stream_);
+        } else if (event_aggregation_ == "evt3_runs_gpu") {
           cuda_backend_->update_bins(direct_bin_updates_, *cuda_stream_);
           cuda_backend_->snapshot(reinterpret_cast<float *>(write_handle.get_ptr()),
             window_end_us, *cuda_stream_);
@@ -994,7 +1159,7 @@ void AsyncEventTensorPreprocessorNode::publish_snapshot(
       update_max(state_age_max_ns_, age_ns);
     }
   } catch (const std::exception & error) {
-    if (event_aggregation_ == "evt3_runs_gpu") {
+    if (event_aggregation_ == "evt3_runs_gpu" || event_aggregation_ == "evt3_runs_gpu_direct") {
       std::lock_guard<std::mutex> lock(direct_mutex_);
       direct_histogram_->mark_all_dirty();
     }
@@ -1291,10 +1456,18 @@ void AsyncEventTensorPreprocessorNode::publish_diagnostics()
   status.message = healthy ? "fixed-rate pipeline healthy" :
     "event queue, timestamp, CUDA pool, or fixed-rate deadline issue detected";
   status.values = {
-    value("pipeline_mode", "single_node_async"),
+    value("pipeline_mode", grouped_stream_ ? "single_worker_grouped_cuda" : "single_node_async"),
     value("event_aggregation", event_aggregation_),
-    value("tensor_upload", event_aggregation_ == "evt3_runs_gpu" ? "dirty_cpu_bins" :
-      (direct_histogram_ ? "full_cpu_snapshot" : "gpu_ring_snapshot")),
+    value("tensor_upload", grouped_stream_ ? "compressed_raw_and_runs" :
+      (event_aggregation_ == "evt3_runs_gpu_direct" ? "direct_dirty_cpu_bins" :
+      (event_aggregation_ == "evt3_runs_gpu" ? "dirty_cpu_bins" :
+      (direct_histogram_ ? "full_cpu_snapshot" : "gpu_ring_snapshot")))),
+    number("grouped_max_packet_bytes", grouped_max_packet_bytes_),
+    number("grouped_max_runs", grouped_max_runs_),
+    number("grouped_limit_drops", grouped_limit_drops_.exchange(0)),
+    number("grouped_raw_h2d_bytes", grouped_raw_bytes_.exchange(0)),
+    number("grouped_descriptor_h2d_bytes", grouped_descriptor_bytes_.exchange(0)),
+    number("grouped_runs", grouped_run_count_.exchange(0)),
     number("packets_received_per_s", packets / elapsed_s),
     number(
       "packets_received_total",

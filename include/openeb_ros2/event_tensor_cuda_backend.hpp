@@ -8,6 +8,8 @@
 #include <memory>
 #include <vector>
 #include "openeb_ros2/histogram_bin_updates.hpp"
+#include "openeb_ros2/histogram_bin_view.hpp"
+#include "openeb_ros2/evt3_run_batch.hpp"
 
 namespace openeb_ros2
 {
@@ -42,6 +44,16 @@ public:
   // Copies absolute dirty CPU bins through owned pinned buffers. Calls must
   // use one stream; do not mix event updates and bin updates without reset().
   void update_bins(const HistogramBinUpdates & updates, cudaStream_t stream);
+  // One CPU payload copy: borrowed histogram planes -> owned pinned staging.
+  // Caller keeps histogram immutable through this call, then may resume CPU
+  // updates even while H2D is pending. Acknowledge dirty flags only on success.
+  void update_bins_direct(const HistogramBinView & view, cudaStream_t stream);
+  // Reserve two owned pinned/device staging slots before measured replay.
+  void reserve_grouped_raw(std::size_t raw_bytes, std::size_t runs);
+  // RAW bytes and run metadata are copied before return; caller may reuse
+  // both inputs after return. GPU expands words directly into the histogram.
+  void update_grouped_raw(const Evt3RunBatch & batch, const std::uint8_t * raw,
+    std::size_t raw_bytes, cudaStream_t stream);
   void snapshot(float * output, std::int64_t window_end_us, cudaStream_t stream);
 
   bool ready() const;

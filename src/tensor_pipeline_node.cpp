@@ -23,11 +23,18 @@ int main(int argc, char ** argv)
     if (backend != "cpu" && backend != "cuda" && backend != "cuda_async") {
       throw std::invalid_argument("tensor_backend must be cpu, cuda, or cuda_async");
     }
+    descriptor.description = "Optional async aggregation override; empty preserves tensor YAML";
+    const auto aggregation = selector->declare_parameter<std::string>("event_aggregation", "", descriptor);
+    if (!aggregation.empty() && (backend != "cuda_async" ||
+      (aggregation != "events" && aggregation != "evt3_runs" && aggregation != "evt3_runs_gpu" &&
+       aggregation != "evt3_runs_gpu_direct" && aggregation != "evt3_runs_grouped_gpu")))
+      throw std::invalid_argument("event_aggregation override requires cuda_async and a valid aggregation mode");
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
     const auto ns = std::string(selector->get_namespace());
     auto tensor_options = options;
     tensor_options.arguments({"--ros-args", "-r", "__node:=event_tensor", "-r", "__ns:=" + ns});
     tensor_options.append_parameter_override("subscribe_packets", false);
+    if (!aggregation.empty()) tensor_options.append_parameter_override("event_aggregation", aggregation);
     std::shared_ptr<rclcpp::Node> tensor;
     openeb_ros2::DriverComponent::PacketSink sink;
     if (backend == "cuda_async") {

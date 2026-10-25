@@ -112,3 +112,45 @@ CPU testで14/64/65536byte境界、vector encoding、OOB、小時刻逆転、rin
 手元RAW冒頭16MiBもCPU一致。portable CTestとrunner検査、host C++構文検査を実施。
 このMacではnvcc/GPUを使っていない。CUDA compile、GPU一致と高速化は未確認。
 通常async nodeのworker scheduling/ROS/USB/実車の性能保証とは分離する。
+
+## CPU中間コピー削減
+
+borrowed HistogramBinViewでCPU payloadコピーを2回→1回へ削減するAPIと独立ペアbenchmarkを追加。
+従来owned exportは維持。copy_sweep.pyは現evt3_runs_gpuと新evt3_runs_gpu_directを同一binaryで比較する。
+毎窓GPU同士＋CPU FP32参照の全要素bitwise一致、採用/drop数、H2D量一致を必須とする。
+CPUコピーbyte数はpayloadの論理値であり、DRAM trafficや速度向上の測定結果ではない。
+Macでportable CTest、Python runnerのschema／成功・失敗保存／dry-run、実RAW冒頭約635万イベント100窓のCPU一致を検査。
+host C++はCUDA宣言stubによる構文検査のみ。nvcc compileとGPU executionは未実施。
+CUDA testに非同期H2D中のCPU ring変更、4 pinned slot再利用、null pointer拒否を追加。
+これらCUDA testが実機で通るまでは、GPU側の一致・高速化を確認済みとはしない。
+
+## 圧縮runのGPU histogram集計
+
+Evt3RunScanner / Evt3RunBatchとCUDA direct run accumulationを追加し、現evt3_runs_gpu_directと比較。
+CPU scannerはpixel histogramを作らず、元RAW＋24byte/run descriptorをGPUへ送り、直接ringへatomic加算。
+既存snapshot kernelを共用し、benchmarkで毎窓GPU同士＋CPU参照のFP32 20ch Tensorをbitwise比較する。
+portable testは公式decoder/scalar core/CPU run mirror/dirty mirrorを比較し、packet境界・clock wrap・
+vector base uint16 wrap・逆転drop/reset・OOB・layout・normalizationを検査。
+Macではnvcc/GPUは使用していない。CUDA compile/実行と性能改善はLinuxで確認する。
+GPU testは2 slotのstaging再利用、RAWの即時破壊・再利用、default streamとcreated streamも検査する。
+RAW preflight/index/容量決定とD2H照合は計測外。decode/scan・配列生成・staging・H2D・GPU集計/clear・
+20ch Tensor生成・完了待ちをtotalへ含め、CPU側stage時間とRAW/descriptor転送byte数も保存する。
+
+手元RAWはpayload先頭256MiBから1000窓（77,075,377採用イベント、178,454,528処理byte）を
+CPUで公式decoder/core/圧縮run mirrorまで照合し、FP32 [1,20,120,160] の一致を確認。
+portable CTest 6/6、Python runner unit検査11件、CUDA宣言stubによるhost C++構文検査まで実施。
+これは新kernelのnvccコンパイルやGPU上での一致を確認したものではない。
+
+## ROS mode統合とbringup選択
+
+async nodeにevt3_runs_gpu_direct / evt3_runs_grouped_gpuを起動時選択として追加。既定eventsと既存3方式を維持。
+groupedは有界packet queueと専用worker 1本、非同期CUDA streamを使用。別decode worker/decoded event queueは使わない。
+Evt3GroupedStreamでpacket/run cap、sequence gap/reorder、geometry、decode error後の再取得を検査。
+Nodeはqueue overflow/oversize/staleでもparser/GPU/scheduleをresetし、残ったRAW prefixを混在させない。
+4ms以内のイベント時刻逆転はdropで継続する。modeは再起動で切替える。
+CLI/TUIの--evs-aggregationとlaunch evs_aggregationからselector override→childへ伝播し、custom Tensor設定を保持する。
+全async profileに追加上限を明記、新2profileもpackageとkart_bringupへ追加。
+
+Mac: portable CTest、packet-stream/CPU Tensor照合、CLI/TUI、launch mock、C++ ROS/CUDA宣言stubによる構文検査。
+ROS/SDK/CUDAをリンクしたbuild、USB camera live、推論併走、Orinは未検証。
+既存TUI testのIMU選択fixtureとsection-E2E testのcuvslam mockを実装に合わせて更新した。

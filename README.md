@@ -350,3 +350,66 @@ decode、イベント列生成または直接集計、転送、Tensor生成、GP
 全Tensor要素の一致を毎窓確認し、p50/p95/p99、イベントレート別・窓別CSVを保存する。
 USB/ROS queue/publication/推論とframe間overlapは含まない。通常node/configは変更しない。
 MacのCPU照合とCUDA host側の構文検査まで実施。CUDA build・GPU速度はLinux実行で要確認。
+
+### CPU中間コピー削減の比較
+
+`EventTensorCudaBackend::update_bins_direct(HistogramBinView)`と
+`Evt3RunsHistogram::peek_dirty_bins()/acknowledge_dirty_bins()`を追加した。
+CPU ring→中間vector→pinned stagingのうち中間vectorを省き、GPU転送量・FP32 20ch Tensorを保持する。
+[Linux比較手順](tools/cuda_benchmark/README.md#4-cpu中間コピー削減のペア比較)の
+`event_tensor_raw_copy_cuda_benchmark`／`copy_sweep.py`で現在のevt3_runs_gpuとペア比較する。
+evt3_runs_gpu_directは比較用に加え、現在はROS async nodeの起動時選択にも対応。既定eventsとtopicは保持。
+毎窓GPU同士とCPU参照のbitwise一致・H2D量一致を検査し、copy byte数と処理時間内訳を保存する。
+MacではCPU portable検査と実RAW冒頭100窓の一致、CUDA host C++構文検査を実施。
+CUDA compile、GPU一致確認、高速化はLinuxで実行する必要がある。
+
+### 圧縮EVT3 runのGPU集計を比較
+
+`Evt3RunScanner`でCPUのpixel集計を省き、元の16bit RAW＋24byte/run descriptorを
+`EventTensorCudaBackend::update_grouped_raw()`へ転送してGPUでヒストグラムを生成する方式を追加。
+展開済みイベント配列はCPU/GPUとも作らず、既存のsnapshot kernelでFP32 20ch Tensorを生成する。
+[Linux比較手順](tools/cuda_benchmark/README.md#5-圧縮イベント群をgpuでヒストグラム化するペア比較)の
+`event_tensor_raw_grouped_cuda_benchmark`／`grouped_sweep.py`でevt3_runs_gpu_directとペア比較する。
+毎窓、GPU Tensor同士＋CPU参照のbitwise一致とdecode数・時刻を確認し、p50/p95/p99とRAW/descriptor転送量を保存。
+evt3_runs_grouped_gpuは比較用に加え、現在はROS async nodeの起動時選択にも対応。既存方式とtopicは保持。
+Macのportable検査とCPU模擬照合を実施。CUDA compile・GPU一致・速度はLinux実行で確認する。
+
+
+### ROSでGPU run集計を選択する
+
+AsyncEventTensorPreprocessorNodeのevent_aggregationにevt3_runs_gpu_direct / evt3_runs_grouped_gpuを追加。
+既定eventsと既存evt3_runs / evt3_runs_gpuは維持する。全方式startup-only。
+node/plugin/入出力topic・型・QoSは従来どおり（/event_camera/tensor、isaac_ros_tensor_msgs/msg/TensorList、GPU FP32 NCHW）。
+標準profileは[1,20,120,160]、40ms窓・4ms stride・250Hz。モデル由来YAMLのshape/正規化も保持する。
+
+```bash
+ros2 launch openeb_ros2 tensor.launch.py tensor_backend:=cuda_async \
+  tensor_config:="$(ros2 pkg prefix openeb_ros2)/share/openeb_ros2/config/tensor_cuda_async_grouped_gpu.yaml"
+```
+
+kartのCLI/TUIはkart_bringup READMEを参照。`--evs-aggregation evt3_runs_grouped_gpu`で選択し、
+backend未指定時はcuda_asyncを選ぶ。明示backend=cpu/cudaとの併用は起動前に拒否する。
+selectorのevent_aggregation既定空文字は従来のTensor YAMLを保持し、CLIの明示値だけchildへoverrideする。
+
+grouped方式は受信callbackから所有権ごとRAWを既存有界packet queueへ渡し、専用workerがscanとCUDA enqueueを行う。
+別decode workerや展開済みevent配列/decoded queueは使わず、CUDA stream上のGPU処理は非同期。
+1 packetずつ圧縮RAW＋run descriptorをowned pinned/device slotへコピーしてGPU ringへ集計する。
+packet上限grouped_max_packet_bytes=1048576、run上限grouped_max_runs=65536を事前確保する。
+queue overflow、上限超過、stale破棄、sequence欠落/逆順、geometry変更、decode/CUDA errorでは
+parser/GPU ring/scheduleをリセットし、新しいepochで窓を生成できる状態まで再取得してから再開する。
+4ms以内のイベント時刻逆転はそのイベントをdropし、streamをresetしない。
+
+evt3_runs_gpu_directは既存のCPU decode/GPU snapshot worker構成を維持。
+mutex内でCPU ringをpinnedへ退避してからdirtyをackし、GPU snapshotはlock外で構成する。
+転送失敗時は全dirtyを再送し、decoder中のring更新とDMAを競合させない。
+
+診断はevent_aggregation=evt3_runs_grouped_gpu、tensor_upload=compressed_raw_and_runs。
+grouped_raw_h2d_bytes/grouped_descriptor_h2d_bytes/grouped_runs/grouped_limit_dropsは診断interval内の値。
+groupedのdecode_timeはscan、decode_serviceはGPU submitを含むworker全体で、
+decode_scheduling_delayにはCUDA slot再利用待ちも含む。CPU使用率や純粋なscheduler遅延と混同しない。
+
+Linux単独benchmarkのユーザー実行報告でGPU Tensor/CPU参照一致を確認済み。
+今回のROS統合はMacでportable/CLI/TUI/launch stub/host C++ stub構文検査まで。
+ROS＋SDK＋CUDA build・USB live・DNN併走・Orinの速度は未確認。
+独立benchmarkは4ms相当frameでGPUへまとめて送るが、ROS実装はSDK packet単位なので、
+同じkernelでも呼出し頻度・queue待ちによって処理時間は変わり得る。

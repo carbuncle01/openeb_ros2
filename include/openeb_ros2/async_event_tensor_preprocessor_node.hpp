@@ -23,6 +23,7 @@
 #include "isaac_ros_common/cuda_stream.hpp"
 #include "openeb_ros2/tensor_output.hpp"
 #include "openeb_ros2/evt3_runs_histogram.hpp"
+#include "openeb_ros2/evt3_grouped_stream.hpp"
 #include "isaac_ros_tensor_msgs/msg/tensor_list.hpp"
 #include "openeb_ros2/event_tensor_cuda_backend.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -82,6 +83,10 @@ private:
   void decode_loop();
   void gpu_loop();
   void direct_gpu_loop();
+  void grouped_gpu_loop();
+  void decode_grouped_packet(PacketWork work);
+  void reset_grouped_output();
+  void reset_grouped_pipeline();
   void decode_direct_packet(PacketWork work);
   void decode_packet(PacketWork work);
   std::unique_ptr<std::vector<CudaEvent>> acquire_decode_buffer();
@@ -132,6 +137,11 @@ private:
   std::int64_t direct_offset_ns_{0};
   std::vector<float> direct_snapshot_buffer_;
   HistogramBinUpdates direct_bin_updates_;
+  HistogramBinView direct_bin_view_;
+  std::unique_ptr<Evt3GroupedStream> grouped_stream_;
+  std::atomic<bool> grouped_reset_pending_{false};
+  std::size_t grouped_max_packet_bytes_{1048576U},grouped_max_runs_{65536U};
+  std::atomic<std::uint64_t> grouped_raw_bytes_{0},grouped_descriptor_bytes_{0},grouped_run_count_{0},grouped_limit_drops_{0};
   std::unique_ptr<DecoderFactory> decoder_factory_;
   std::unique_ptr<EventTensorCudaBackend> cuda_backend_;
   nvidia::isaac_ros::common::CudaStreamPtr cuda_stream_;

@@ -69,6 +69,33 @@ __global__ void accumulate_events(
   atomicAdd(ring + channel * width * height + pixel, value);
 }
 
+// One warp per run; no expanded event array is allocated on CPU or GPU.
+__global__ void accumulate_evt3_runs(
+  const std::uint16_t * words, const Evt3Run * runs, std::size_t run_count,
+  float * ring, std::size_t width, std::size_t height, unsigned input_width,
+  std::size_t ring_bins, std::int64_t oldest, bool separate, bool major)
+{
+  const auto thread=static_cast<std::size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+  const auto run_index=thread/32;const unsigned lane=thread%32;
+  if(run_index>=run_count)return;
+  const auto run=runs[run_index];if(run.bin<oldest)return;
+  const auto slot=static_cast<std::size_t>(run.bin%static_cast<std::int64_t>(ring_bins));
+  const unsigned count=run.kind==2?run.word_count:(run.kind==4?12u:8u);
+  for(unsigned i=lane;i<count;i+=32) {
+    unsigned x,polarity;
+    if(run.kind==2){const auto word=words[run.word_offset+i];x=word&2047;polarity=(word>>11)&1;}
+    else {
+      if(!(words[run.word_offset]&(1u<<i)))continue;
+      x=static_cast<std::uint16_t>(run.base_x+i);polarity=run.polarity;
+    }
+    if(x>=input_width)continue;
+    const auto p=polarity?0u:1u;
+    const auto channel=separate?(major?p*ring_bins+slot:slot*2+p):slot;
+    const auto pixel=static_cast<std::size_t>(run.y)*width+static_cast<std::size_t>(x)*width/input_width;
+    atomicAdd(ring+channel*width*height+pixel,!separate&&!polarity?-1.0F:1.0F);
+  }
+}
+
 __global__ void make_snapshot(
   const float * ring, float * output, const float * means, const float * stddevs,
   const std::size_t pixels, const std::size_t bins, const std::size_t ring_bins,
@@ -185,6 +212,13 @@ public:
     if (has_stream_work_) {
       (void)cudaStreamSynchronize(last_stream_);
     }
+    for(auto & slot : grouped_slots_) {
+      if(slot.complete)(void)cudaEventDestroy(slot.complete);
+      if(slot.host_raw)(void)cudaFreeHost(slot.host_raw);
+      if(slot.host_runs)(void)cudaFreeHost(slot.host_runs);
+      if(slot.device_raw)(void)cudaFree(slot.device_raw);
+      if(slot.device_runs)(void)cudaFree(slot.device_runs);
+    }
     for (auto & slot : transfer_slots_) {
       if (slot.complete != nullptr) {(void)cudaEventDestroy(slot.complete);}
       if (slot.device != nullptr) {(void)cudaFree(slot.device);}
@@ -203,9 +237,10 @@ public:
   {
     last_stream_ = stream;
     has_stream_work_ = true;
-    check_cuda(cudaMemsetAsync(ring_, 0, ring_bytes_, stream), "reset rolling ring");
     initialized_ = false;
+    check_cuda(cudaMemsetAsync(ring_, 0, ring_bytes_, stream), "reset rolling ring");
     has_bin_epoch_ = false;
+    has_grouped_epoch_ = false;
     origin_timestamp_us_ = 0;
     latest_timestamp_us_ = 0;
     accepted_events_ = 0;
@@ -219,7 +254,7 @@ public:
     if (events == nullptr || event_count == 0U) {
       return;
     }
-    if (has_bin_epoch_ || transfer_slots_[0].host == nullptr)
+    if (has_bin_epoch_ || has_grouped_epoch_ || transfer_slots_[0].host == nullptr)
       throw std::logic_error("Event updates are unavailable for this bin-transfer backend");
     last_stream_ = stream;
     has_stream_work_ = true;
@@ -324,6 +359,115 @@ public:
     }
   }
 
+  void update_bins_direct(const HistogramBinView & update, const cudaStream_t stream)
+  {
+    update.validate(width_, height_, bins_, separate_, polarity_major_, bin_width_us_);
+    if (initialized_ && !has_bin_epoch_)
+      throw std::logic_error("Reset before switching from event updates to bin updates");
+    const bool new_epoch = !has_bin_epoch_ || update.epoch != bin_epoch_;
+    if (!new_epoch && (update.origin_us != origin_timestamp_us_ ||
+      update.newest_bin < newest_bin_ || update.latest_us < latest_timestamp_us_))
+      throw std::invalid_argument("Out-of-order absolute bin update");
+    last_stream_ = stream;
+    has_stream_work_ = true;
+    try {
+      initialize_bin_slots();
+      if (new_epoch) check_cuda(cudaMemsetAsync(ring_, 0, ring_bytes_, stream), "reset bin-transfer ring");
+      const auto planes = separate_ ? 2U:1U;
+      for (std::size_t i=0; i<update.slots.size(); ++i) {
+        auto & staging = bin_transfer_slots_[next_bin_transfer_slot_];
+        next_bin_transfer_slot_ = (next_bin_transfer_slot_+1U)%bin_transfer_slots_.size();
+        if (staging.pending) check_cuda(cudaEventSynchronize(staging.complete), "wait for bin staging");
+        update.copy_slot_to(i, static_cast<float *>(staging.host));
+        for (std::size_t p=0; p<planes; ++p) {
+          const auto channel = separate_ ?
+            (polarity_major_ ? p*ring_bins_+update.slots[i] : update.slots[i]*2U+p) : update.slots[i];
+          check_cuda(cudaMemcpyAsync(ring_+channel*pixels_, staging.host+p*pixels_,
+            pixels_*sizeof(float), cudaMemcpyHostToDevice, stream), "upload dirty histogram plane");
+        }
+        check_cuda(cudaEventRecord(staging.complete, stream), "record bin staging completion");
+        staging.pending = true;
+      }
+      origin_timestamp_us_ = update.origin_us;
+      newest_bin_ = update.newest_bin; latest_timestamp_us_ = update.latest_us;
+      bin_epoch_ = update.epoch; has_bin_epoch_ = true; initialized_ = true;
+    } catch (...) {
+      // An upload may have enqueued one plane before failing. Its pinned host
+      // storage must survive until pending DMA is done, even on the error path.
+      (void)cudaStreamSynchronize(stream);
+      initialized_ = false; has_bin_epoch_ = false;
+      throw;
+    }
+  }
+
+  void reserve_grouped_raw(std::size_t raw_bytes, std::size_t runs)
+  {
+    if(!raw_bytes || !runs || runs>SIZE_MAX/sizeof(Evt3Run))throw std::invalid_argument("Grouped staging capacity must be positive");
+    for(auto& slot:grouped_slots_) {
+      if(slot.pending) {check_cuda(cudaEventSynchronize(slot.complete),"wait for grouped staging resize");slot.pending=false;}
+      if(!slot.complete)check_cuda(cudaEventCreateWithFlags(&slot.complete,cudaEventDisableTiming),"create grouped staging event");
+      if(raw_bytes>slot.raw_capacity) {
+        if(slot.host_raw){check_cuda(cudaFreeHost(slot.host_raw),"free grouped host RAW");slot.host_raw=nullptr;}
+        if(slot.device_raw){check_cuda(cudaFree(slot.device_raw),"free grouped device RAW");slot.device_raw=nullptr;}
+        slot.raw_capacity=0;
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.host_raw),raw_bytes),"allocate grouped host RAW");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&slot.device_raw),raw_bytes),"allocate grouped device RAW");
+        slot.raw_capacity=raw_bytes;
+      }
+      if(runs>slot.run_capacity) {
+        if(slot.host_runs){check_cuda(cudaFreeHost(slot.host_runs),"free grouped host descriptors");slot.host_runs=nullptr;}
+        if(slot.device_runs){check_cuda(cudaFree(slot.device_runs),"free grouped device descriptors");slot.device_runs=nullptr;}
+        slot.run_capacity=0;
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.host_runs),runs*sizeof(Evt3Run)),"allocate grouped host descriptors");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&slot.device_runs),runs*sizeof(Evt3Run)),"allocate grouped device descriptors");
+        slot.run_capacity=runs;
+      }
+    }
+  }
+
+  void update_grouped_raw(const Evt3RunBatch& batch,const std::uint8_t* raw,
+    std::size_t raw_bytes,cudaStream_t stream)
+  {
+    batch.validate(width_,height_,bins_,separate_,polarity_major_,bin_width_us_);
+    if(!raw||raw_bytes!=batch.raw_bytes)throw std::invalid_argument("Grouped RAW buffer differs from descriptors");
+    if(initialized_&&!has_grouped_epoch_)throw std::logic_error("Reset before switching grouped/event/bin update modes");
+    const auto& m=batch.metadata;const bool epoch=!has_grouped_epoch_||m.epoch!=grouped_epoch_;
+    if(!epoch&&(m.origin_us!=origin_timestamp_us_||m.newest_bin<newest_bin_||m.latest_us<latest_timestamp_us_))
+      throw std::invalid_argument("Out-of-order grouped RAW batch");
+    auto& slot=grouped_slots_[next_grouped_slot_];
+    if(raw_bytes>slot.raw_capacity||batch.runs.size()>slot.run_capacity)
+      throw std::length_error("Grouped staging too small; reserve_grouped_raw before replay");
+    last_stream_=stream;has_stream_work_=true;
+    try {
+      if(slot.pending)check_cuda(cudaEventSynchronize(slot.complete),"wait for grouped RAW staging");
+      std::memcpy(slot.host_raw,raw,raw_bytes);
+      if(!batch.runs.empty())std::memcpy(slot.host_runs,batch.runs.data(),batch.runs.size()*sizeof(Evt3Run));
+      if(epoch||m.newest_bin-newest_bin_>=static_cast<std::int64_t>(ring_bins_))
+        check_cuda(cudaMemsetAsync(ring_,0,ring_bytes_,stream),"clear grouped rolling ring");
+      else for(auto b=newest_bin_+1;b<=m.newest_bin;++b) {
+        const auto count=pixels_*(separate_?2u:1u);
+        clear_time_slot<<<static_cast<unsigned>((count+255)/256),256,0,stream>>>(ring_,pixels_,ring_bins_,b%ring_bins_,separate_,polarity_major_);
+      }
+      check_cuda(cudaGetLastError(),"clear grouped bins");
+      check_cuda(cudaMemcpyAsync(slot.device_raw,slot.host_raw,raw_bytes,cudaMemcpyHostToDevice,stream),"upload compressed RAW");
+      if(!batch.runs.empty()) {
+        check_cuda(cudaMemcpyAsync(slot.device_runs,slot.host_runs,batch.runs.size()*sizeof(Evt3Run),cudaMemcpyHostToDevice,stream),"upload EVT3 run descriptors");
+        constexpr unsigned threads=128;
+        const auto blocks=static_cast<unsigned>((batch.runs.size()+3)/4);
+        accumulate_evt3_runs<<<blocks,threads,0,stream>>>(slot.device_raw,slot.device_runs,batch.runs.size(),ring_,width_,height_,batch.input_width,
+          ring_bins_,m.newest_bin-static_cast<std::int64_t>(ring_bins_-1),separate_,polarity_major_);
+        check_cuda(cudaGetLastError(),"accumulate compressed EVT3 runs");
+      }
+      check_cuda(cudaEventRecord(slot.complete,stream),"record grouped staging completion");slot.pending=true;
+      next_grouped_slot_=(next_grouped_slot_+1)%grouped_slots_.size();
+      origin_timestamp_us_=m.origin_us;latest_timestamp_us_=m.latest_us;newest_bin_=m.newest_bin;
+      accepted_events_=epoch?batch.accepted_events:accepted_events_+batch.accepted_events;
+      grouped_epoch_=m.epoch;has_grouped_epoch_=true;initialized_=true;
+    } catch(...) {
+      (void)cudaStreamSynchronize(stream);initialized_=false;has_grouped_epoch_=false;throw;
+    }
+  }
+
   void snapshot(
     float * output, const std::int64_t window_end_us, const cudaStream_t stream)
   {
@@ -357,6 +501,13 @@ public:
       origin_timestamp_us_ + (newest_bin_ + 1) * bin_width_us_ : 0;
   }
 
+  struct GroupedTransferSlot {
+    std::uint8_t* host_raw{nullptr};std::uint16_t* device_raw{nullptr};
+    Evt3Run* host_runs{nullptr};Evt3Run* device_runs{nullptr};
+    std::size_t raw_capacity{0},run_capacity{0};cudaEvent_t complete{nullptr};bool pending{false};
+  };
+  std::vector<GroupedTransferSlot> grouped_slots_{2};std::size_t next_grouped_slot_{0};
+  bool has_grouped_epoch_{false};std::uint64_t grouped_epoch_{0};
   struct TransferSlot
   {
     CudaEvent * host{nullptr};
@@ -434,6 +585,22 @@ void EventTensorCudaBackend::update_bins(
   const HistogramBinUpdates & updates, const cudaStream_t stream)
 {
   impl_->update_bins(updates, stream);
+}
+
+void EventTensorCudaBackend::update_bins_direct(
+  const HistogramBinView & view, const cudaStream_t stream)
+{
+  impl_->update_bins_direct(view, stream);
+}
+
+void EventTensorCudaBackend::reserve_grouped_raw(std::size_t raw_bytes,std::size_t runs)
+{
+  impl_->reserve_grouped_raw(raw_bytes,runs);
+}
+void EventTensorCudaBackend::update_grouped_raw(const Evt3RunBatch& batch,
+  const std::uint8_t* raw,std::size_t raw_bytes,cudaStream_t stream)
+{
+  impl_->update_grouped_raw(batch,raw,raw_bytes,stream);
 }
 
 void EventTensorCudaBackend::snapshot(

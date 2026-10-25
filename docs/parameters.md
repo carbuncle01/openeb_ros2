@@ -123,7 +123,7 @@ config/tensor_*.yamlはdirect pipeline向けのsubscribe_packets=false。単体c
 
 | 名前 | 基準値 | 意味 |
 |---|---|---|
-| `event_aggregation` | `"events"` | 起動時固定。eventsは従来のイベント配列＋GPU集計、evt3_runsはCPU直接集計＋全Tensor転送、evt3_runs_gpuはCPU直接集計＋変更bin転送＋GPU Tensor生成。cuda_asyncのみ。 |
+| `event_aggregation` | `"events"` | 起動時固定。eventsは従来のイベント配列＋GPU集計、evt3_runsはCPU直接集計＋全Tensor転送、evt3_runs_gpuはCPU直接集計＋変更bin転送＋GPU Tensor生成。evt3_runs_gpu_directはCPU中間コピー削減版、evt3_runs_grouped_gpuはCPU run scan＋GPU集計。cuda_asyncのみ。 |
 | `bins` | `10` | 時間bin数。 |
 | `width` | `160` | 出力tensor幅[pixel]。 |
 | `height` | `120` | 出力tensor高さ[pixel]。 |
@@ -161,3 +161,20 @@ split_duration=0・保存先空・packet配信OFFを設定する。保存先はb
 config/visualization.yamlはpreprocessor.yamlと同じ全parameterを持ち、subscribe_packets=false・
 packet_forward_enabled=false・style=red_blue_white・window/stride=40 msを設定する。
 単体preprocessor既定はdark/topic入力、integrated pipelineではこの可視化profileを使う。
+
+
+### grouped GPU方式の上限・選択
+
+| parameter | node既定値 | 意味 |
+|---|---|---|
+| grouped_max_packet_bytes | 1048576 | 起動時固定。1 RAW packetの上限byte数。偶数、2..16777216。grouped方式のみ使用。超過は破棄・stream再取得。 |
+| grouped_max_runs | 65536 | 起動時固定。1 packetのrun descriptor数上限。1..grouped_max_packet_bytes/2。超過で破棄・stream再取得。 |
+
+追加上限は全async YAMLへ明記し、既存方式では使用しない。
+既定で2 staging slot分のpinned＋device payload容量は約10MiB（RAWと24byte/runを含む）。
+RAW受信queueは既存packet_queue_capacity（既定64）で上限を持ち、groupedはdecoded queue/poolを使用しない。
+運用profileはkart_bringup/config/sensors/openeb_tensor_cuda_async_grouped_gpu.yaml。
+
+openeb_tensor_pipeline selector自身のevent_aggregation既定値は空文字。
+空ならevent_tensor用YAMLを保持し、非空ならcuda_async childへ明示overrideする。
+このoverrideはbins/shape/mean/stdを変更しない。startup-onlyで切替は再起動する。

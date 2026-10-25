@@ -29,7 +29,9 @@ def main():
              ("event_tensor_encoder_node.cpp", "tensor_cuda.yaml"),
              ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async.yaml"),
              ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async_runs.yaml"),
-             ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async_runs_gpu.yaml")]
+             ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async_runs_gpu.yaml"),
+             ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async_runs_gpu_direct.yaml"),
+             ("async_event_tensor_preprocessor_node.cpp", "tensor_cuda_async_grouped_gpu.yaml")]
     for source, config in pairs:
         declared = parameters(ROOT / "src" / source)
         actual = configured(ROOT / "config" / config)
@@ -59,7 +61,7 @@ def main():
     assert "jetpilot_msgs" not in dependencies
     assert {"cuda_buffer", "tensor_msgs", "isaac_ros_tensor_msgs"} <= dependencies
     assert package.find("buildtool_depend").text == "ament_cmake_auto"
-    print("PASS: 7 configurations cover declared parameters; backend contracts, launch syntax, package dependencies")
+    print("PASS: 9 configurations cover declared parameters; backend contracts, launch syntax, package dependencies")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 #include <vector>
 #include <cstring>
 #include "openeb_ros2/histogram_bin_updates.hpp"
+#include "openeb_ros2/histogram_bin_view.hpp"
 
 namespace openeb_ros2 {
 // External serialization required. No ROS, CUDA, per-event storage or ownership
@@ -122,6 +123,23 @@ public:
         ring_.data()+channel(out.slots[i],p)*pixels_,pixels_*sizeof(float));
     std::fill(dirty_.begin(),dirty_.end(),false);
   }
+  // No histogram payload copy. Hold the external lock until the backend has
+  // copied ALL planes into owned pinned storage and returned successfully.
+  // Failed uploads leave dirty flags intact; retry with mark_all_dirty() if
+  // backend state was invalidated. Do not feed/reset between peek and ack.
+  void peek_dirty_bins(HistogramBinView& out) const {
+    if(!initialized_)throw std::logic_error("Histogram is not initialized");
+    out.width=width_;out.height=height_;out.bins=bins_;
+    out.separate=separate_;out.polarity_major=polarity_major_;out.epoch=epoch_;
+    out.origin_us=origin_;out.latest_us=latest_;out.newest_bin=newest_;out.bin_width_us=bin_us_;
+    out.slots.clear();out.planes.clear();
+    for(std::size_t slot=0;slot<ring_bins_;++slot)if(dirty_[slot]) {
+      out.slots.push_back(slot);
+      for(std::size_t p=0;p<(separate_?2u:1u);++p)
+        out.planes.push_back(ring_.data()+channel(slot,p)*pixels_);
+    }
+  }
+  void acknowledge_dirty_bins() {std::fill(dirty_.begin(),dirty_.end(),false);}
   void mark_all_dirty() {std::fill(dirty_.begin(),dirty_.end(),true);}
   // Same retained time range and half-open windows as EventTensorCudaBackend.
   void snapshot(float* out, std::int64_t end_us,

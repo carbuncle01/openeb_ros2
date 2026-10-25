@@ -1,5 +1,7 @@
 /**/event_tensor:
   ros__parameters:
+    grouped_max_packet_bytes: 1048576
+    grouped_max_runs: 65536
     event_aggregation: "events"
     bins: 10
     width: 160
