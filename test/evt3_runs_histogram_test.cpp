@@ -31,5 +31,31 @@ int main()try {
   require(h.statistics().backward==2,"backward-run diagnostic mismatch");
   const auto epoch=h.epoch();h.reset_stream();require(!h.ready() && h.epoch()>epoch,"reset must invalidate ring");
   bool rejected=false;try{h.feed(a.data(),1);}catch(const std::invalid_argument&){rejected=true;}require(rejected,"odd packet accepted");
+  {
+    Evt3RunsHistogram clock(4,3,2,2000,true,true);clock.set_geometry(8,6);
+    auto feed=[&](std::initializer_list<std::uint16_t> words){auto data=bytes(words);clock.feed(data.data(),data.size());};
+    // Accumulate two 24-bit wraps, then simulate a forward packet loss.
+    feed({0x8fff,0x6000,0x0000,0x2800});
+    feed({0x8000,0x6000,0x2800});
+    feed({0x8fff,0x6000,0x2800});
+    feed({0x8000,0x6000,0x2800});
+    feed({0x8c6e,0x6000,0x2800});
+    const auto before=clock.latest();const auto old_epoch=clock.epoch();
+    clock.reset_stream(true);
+    require(!clock.ready() && clock.epoch()>old_epoch,"gap must clear histogram");
+    feed({0x6001,0x0000,0x2800});
+    require(!clock.ready(),"gap must reacquire HIGH and LOW");
+    feed({0x8c6e,0x6064,0x0000,0x2800});
+    require(clock.latest()==before+100,"gap lost accumulated 33554432 us");
+    require(clock.origin()==before+100,"gap retained old histogram origin");
+    // A wrap during the missing interval must also be counted.
+    feed({0x8fff,0x6000,0x2800});
+    clock.reset_stream(true);
+    feed({0x8000,0x6064,0x0000,0x2800});
+    require(clock.latest()==3*(1LL<<24)+100,"wrap inside gap was lost");
+    // Explicit new-stream reset still starts a fresh clock.
+    clock.reset_stream();feed({0x8000,0x6064,0x0000,0x2800});
+    require(clock.latest()==100,"full reset retained previous clock");
+  }
   std::cout<<"evt3_runs_histogram_test passed\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

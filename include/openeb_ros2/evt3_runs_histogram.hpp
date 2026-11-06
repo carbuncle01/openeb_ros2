@@ -47,8 +47,11 @@ public:
     for (std::size_t y=0; y<height; ++y) ys_[y]=y*height_/height;
     reset_stream();
   }
-  void reset_stream() {
-    valid_time_=false; high_=0; low_=0; y_=0; base_=0; polarity_=0;
+  // Missing compressed words invalidate coordinates and low time, but a short
+  // forward packet gap does not invalidate the accumulated EVT3 wrap count.
+  // Keep the last HIGH too, so reacquisition can detect a wrap inside the gap.
+  void reset_stream(bool preserve_clock = false) {
+    valid_time_=false; if (!preserve_clock) high_=0; low_=0; y_=0; base_=0; polarity_=0;
     clear_epoch();
   }
   void clear_epoch() {

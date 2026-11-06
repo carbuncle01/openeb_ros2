@@ -681,8 +681,14 @@ void AsyncEventTensorPreprocessorNode::decode_direct_packet(PacketWork work)
       packet_width_ = packet.width; packet_height_ = packet.height;
       coordinate_lut_rebuilds_.fetch_add(1, std::memory_order_relaxed);
     } else if (direct_has_sequence_ && static_cast<std::uint64_t>(packet.seq) != direct_sequence_+1) {
-      // Lost compressed words invalidate y/time/vector state. Never mix epochs.
-      direct_histogram_->reset_stream();
+      // A forward gap (including our stale-queue drops) loses compression
+      // state, not the sensor clock. Reordered/restarted streams are distinct.
+      const bool forward_gap = static_cast<std::uint64_t>(packet.seq) > direct_sequence_;
+      direct_histogram_->reset_stream(forward_gap);
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+        "Direct EVT3 sequence discontinuity: previous=%llu current=%llu preserve_clock=%s",
+        static_cast<unsigned long long>(direct_sequence_),
+        static_cast<unsigned long long>(packet.seq), forward_gap ? "true" : "false");
     }
     direct_sequence_ = packet.seq; direct_has_sequence_ = true;
     direct_histogram_->feed(packet.events.data(), packet.events.size());
